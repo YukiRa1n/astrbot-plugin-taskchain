@@ -122,11 +122,11 @@ class TaskChainToolPlugin(Star):
         tasks_json: str = "[]",
         chain_id: str = "",
     ) -> str:
-        """角色扮演沉浸式时间推进器。当你要去做某事时（泡茶/咖啡、做饭、查资料、拿东西、学习、看网课等），用此工具推进时间。系统会自动推进到下一阶段，不需要手动 advance。interact是期间提示词不是逐字稿。调用即进入状态，不在回复中提工具或时间。
+        """角色扮演沉浸式时间推进器。当你要去做某事时（泡茶/咖啡、做饭、查资料、拿东西、学习、看网课等），用此工具推进时间。系统自动推进，不需要手动 advance。interact_prompt是给AI的提示词（如"询问口味偏好"），不是台词。调用即进入状态，不在回复中提工具或时间。
 
         Args:
             action(string): create创建 list查看 cancel取消。
-            tasks_json(string): action=create时必填。JSON数组1个主任务: [{"name":"做什么","duration_minutes":3,"prompt":"到点状态提示","interact":"期间互动提示词(可选)","interact_duration":0.5}]
+            tasks_json(string): action=create时必填。JSON数组1个主任务: [{"name":"做什么","duration_minutes":3,"prompt":"到点状态提示","interact_prompt":"期间AI的提示指令(简洁的一句话,如'问偏好')","interact_duration":0.5}]
             chain_id(string): action=cancel时必填。
         """
         session_id = event.unified_msg_origin
@@ -139,7 +139,7 @@ class TaskChainToolPlugin(Star):
                     return "错误：任务列表不能为空。"
 
                 first = tasks_data[0]
-                interact = first.pop("interact", "")
+                interact_prompt = first.pop("interact_prompt", "") or first.pop("interact", "")
                 interact_duration = float(first.pop("interact_duration", 0.5))
                 tasks_raw = [ChainTask(**t) for t in tasks_data]
                 for t in tasks_raw:
@@ -155,7 +155,7 @@ class TaskChainToolPlugin(Star):
                     prompt=prompts[-1] if prompts else tasks_raw[0].prompt,
                 )
 
-                checkin = self._make_checkin(merged, interact, interact_duration)
+                checkin = self._make_checkin(merged, interact_prompt, interact_duration)
                 main = ChainTask(
                     name=merged.name,
                     description=merged.description,
