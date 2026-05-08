@@ -104,20 +104,15 @@ class TaskChainToolPlugin(Star):
 
     # ── LLM 工具 ──
 
-    def _make_checkin(self, main: ChainTask) -> ChainTask | None:
-        """如果主任务较长，生成一个前置互动任务"""
-        if main.duration_minutes < 2:
+    def _make_checkin(self, main: ChainTask, interact_prompt: str = "") -> ChainTask | None:
+        """如果有互动内容，生成一个前置互动任务"""
+        if not interact_prompt or main.duration_minutes < 1:
             return None
-        checkin_prompt = (
-            f"现在是和用户互动的时机！围绕『{main.name}』自然地询问用户偏好或细节"
-            f"（比如泡咖啡时问想喝什么口味、做饭时问想吃什么），"
-            f"让对话更生动。不要提任务、时间或任何系统类的词。"
-        )
         return ChainTask(
             name=main.name,
             description=main.description,
             duration_minutes=0.5,
-            prompt=checkin_prompt,
+            prompt=interact_prompt,
         )
 
     @llm_tool(name="chain_task")
@@ -128,11 +123,11 @@ class TaskChainToolPlugin(Star):
         tasks_json: str = "[]",
         chain_id: str = "",
     ) -> str:
-        """角色扮演用时间推进器。用户说一会去做什么时，设1个主任务，系统会自动在期间插入一个小互动（如泡咖啡时问想喝什么口味），让对话更生动。调用即进入状态，不告知用户不提工具。与用户对话时建议用list查看当前任务状态来自然衔接。
+        """角色扮演用时间推进器。用户说一会去做什么时设1个主任务，可在任务中加 interact 字段来在期间插入主动互动（如泡咖啡时问想喝什么口味），让对话更生动。调用即进入状态，不告知用户不提工具。与用户对话时建议用list查看当前任务状态来自然衔接。
 
         Args:
             action(string): 操作类型 create(创建) list(查看) cancel(取消) advance(手动推进)。
-            tasks_json(string): action=create 时必填，JSON数组，放1个主任务：[{"name":"干什么","description":"描述","duration_minutes":1,"prompt":"到点后的状态提示"}]。duration_minutes支持小数(0.17=10秒)，较长任务会自动插入互动环节。
+            tasks_json(string): action=create 时必填，JSON数组，放1个主任务：[{"name":"干什么","description":"描述","duration_minutes":1,"prompt":"到点后的状态提示","interact":"你想主动问用户的话（可选）"}]。有interact时会在任务前半段插入互动环节。duration_minutes支持小数(0.17=10秒)。
             chain_id(string): action=cancel/advance 时必填。
         """
         session_id = event.unified_msg_origin
@@ -141,9 +136,12 @@ class TaskChainToolPlugin(Star):
         async with self._lock:
             if action == "create":
                 tasks_data = json.loads(tasks_json)
-                tasks_raw = [ChainTask(**t) for t in tasks_data]
-                if not tasks_raw:
+                if not tasks_data:
                     return "错误：任务列表不能为空。"
+
+                first = tasks_data[0]
+                interact = first.pop("interact", "")
+                tasks_raw = [ChainTask(**t) for t in tasks_data]
                 for t in tasks_raw:
                     secs = max(t.duration_minutes * 60, _MIN_SECONDS)
                     t.duration_minutes = secs / 60
@@ -157,8 +155,7 @@ class TaskChainToolPlugin(Star):
                     prompt=prompts[-1] if prompts else tasks_raw[0].prompt,
                 )
 
-                # 长任务前插一个互动任务
-                checkin = self._make_checkin(merged)
+                checkin = self._make_checkin(merged, interact)
                 main = ChainTask(
                     name=merged.name,
                     description=merged.description,
