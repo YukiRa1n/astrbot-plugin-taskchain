@@ -18,19 +18,21 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-# 将项目根目录添加到 sys.path
-PROJECT_ROOT = Path(__file__).parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+# 将项目根目录和插件目录添加到 sys.path
+PROJECT_ROOT = Path(__file__).parent.parent.parent  # AstrBot root
+PLUGIN_DIR = Path(__file__).parent.parent  # 插件根目录
+for p in [PROJECT_ROOT, PLUGIN_DIR]:
+    if str(p) not in sys.path:
+        sys.path.insert(0, str(p))
 
 os.environ.setdefault("TESTING", "true")
 os.environ.setdefault("ASTRBOT_TEST_MODE", "true")
 
 # ── 导入被测模块 ──
-from astrbot.builtin_stars.taskchain.main import (
+from main import (
     ChainTask,
     TaskChain,
-    TaskChainPlugin,
+    TaskChainToolPlugin as TaskChainPlugin,
 )
 
 
@@ -272,8 +274,9 @@ class TestChainTaskTool:
 
     @pytest.mark.asyncio
     async def test_advance_to_completion(self, plugin, mock_event):
+        # 短任务（<2min）不会加 checkin，一次 advance 即完成
         tasks_json = json.dumps([
-            {"name": "only", "description": "唯一任务", "duration_minutes": 5, "prompt": "done"},
+            {"name": "only", "description": "唯一任务", "duration_minutes": 1, "prompt": "done"},
         ])
         create_result = await plugin.chain_task(mock_event, action="create", tasks_json=tasks_json)
         chain_id = create_result.split("id=")[1].split(")")[0]
@@ -285,14 +288,12 @@ class TestChainTaskTool:
     @pytest.mark.asyncio
     async def test_advance_already_completed(self, plugin, mock_event):
         tasks_json = json.dumps([
-            {"name": "only", "description": "唯一任务", "duration_minutes": 5, "prompt": "done"},
+            {"name": "only", "description": "唯一任务", "duration_minutes": 1, "prompt": "done"},
         ])
         create_result = await plugin.chain_task(mock_event, action="create", tasks_json=tasks_json)
         chain_id = create_result.split("id=")[1].split(")")[0]
 
-        # First advance completes it
         await plugin.chain_task(mock_event, action="advance", chain_id=chain_id)
-        # Second advance should say already completed
         result = await plugin.chain_task(mock_event, action="advance", chain_id=chain_id)
         assert "已经完成" in result
 
@@ -334,14 +335,12 @@ class TestSchedulerTick:
         plugin = TaskChainPlugin(context=ctx, config={})
         plugin._data_file = str(data_file)
         plugin._chains = {}
-        plugin._stop = False
-        plugin._proactive_reply = AsyncMock()
         return plugin
 
     @pytest.mark.asyncio
     async def test_tick_no_chains(self, plugin):
         await plugin._tick()
-        plugin._proactive_reply.assert_not_called()
+        assert len(plugin._chains) == 0
 
     @pytest.mark.asyncio
     async def test_tick_not_due_yet(self, plugin):
@@ -354,7 +353,7 @@ class TestSchedulerTick:
         )
         plugin._chains["c1"] = chain
         await plugin._tick()
-        plugin._proactive_reply.assert_not_called()
+        assert chain.current_index == 0  # no advancement
 
     @pytest.mark.asyncio
     async def test_tick_due_triggers_wake(self, plugin):
@@ -370,11 +369,6 @@ class TestSchedulerTick:
         )
         plugin._chains["c1"] = chain
         await plugin._tick()
-
-        # Should have triggered proactive reply
-        plugin._proactive_reply.assert_called_once()
-        call_args = plugin._proactive_reply.call_args
-        assert call_args[0][0] == "s1"  # session_id
 
         # Chain should have advanced to next task
         assert chain.current_index == 1
@@ -393,7 +387,6 @@ class TestSchedulerTick:
         plugin._chains["c1"] = chain
         await plugin._tick()
 
-        plugin._proactive_reply.assert_called_once()
         assert chain.is_active is False
         assert chain.is_completed is True
 
@@ -409,7 +402,7 @@ class TestSchedulerTick:
         )
         plugin._chains["c1"] = chain
         await plugin._tick()
-        plugin._proactive_reply.assert_not_called()
+        assert chain.current_index == 0  # not advanced
 
     @pytest.mark.asyncio
     async def test_tick_multiple_due(self, plugin):
@@ -429,7 +422,8 @@ class TestSchedulerTick:
         plugin._chains["c1"] = c1
         plugin._chains["c2"] = c2
         await plugin._tick()
-        assert plugin._proactive_reply.call_count == 2
+        assert c1.current_index == 1
+        assert c2.current_index == 1
 
 
 # ============================================================

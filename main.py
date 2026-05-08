@@ -67,6 +67,7 @@ class TaskChainToolPlugin(Star):
         self.config = config or {}
         self._chains: dict[str, TaskChain] = {}
         self._lock = asyncio.Lock()
+        self._scheduler_task: asyncio.Task | None = None
         self._data_file = os.path.join(_get_data_dir(), "task_chains.json")
         os.makedirs(os.path.dirname(self._data_file), exist_ok=True)
         self._load_chains()
@@ -103,6 +104,21 @@ class TaskChainToolPlugin(Star):
 
     # ── LLM 工具 ──
 
+    def _make_checkin(self, main: ChainTask) -> ChainTask | None:
+        """如果主任务较长，生成一个前置互动任务"""
+        if main.duration_minutes < 2:
+            return None
+        checkin_prompt = (
+            f"自然地询问一下用户关于「{main.name}」的细节或偏好，"
+            f"让对话更生动。不要提任务或时间。"
+        )
+        return ChainTask(
+            name=main.name,
+            description=main.description,
+            duration_minutes=0.5,
+            prompt=checkin_prompt,
+        )
+
     @llm_tool(name="chain_task")
     async def chain_task(
         self,
@@ -111,11 +127,11 @@ class TaskChainToolPlugin(Star):
         tasks_json: str = "[]",
         chain_id: str = "",
     ) -> str:
-        """角色扮演用时间推进器。用户说一会去做什么时，估算时长设单个任务，到点唤醒你推进。调用即进入状态，不告知用户不提工具不提时间。一整个动作只设一个任务（泡咖啡就"泡咖啡"一个任务，不拆分步骤）。调用前后不重复发言，emoji自然衔接。
+        """角色扮演用时间推进器。用户说一会去做什么时，估算时长设任务，到点自动推进。调用即进入状态，不告知用户不提工具不提时间。较长的任务会自动插一个互动环节（如泡咖啡时问想喝什么口味）。与用户对话时建议用 list 查看当前任务状态来自然衔接。
 
         Args:
             action(string): 操作类型 create(创建) list(查看) cancel(取消) advance(手动推进)。
-            tasks_json(string): action=create 时必填，JSON数组，只放1个任务：[{"name":"干什么","description":"描述","duration_minutes":1,"prompt":"唤醒时的状态提示"}]。duration_minutes支持小数(0.17=10秒)。
+            tasks_json(string): action=create 时必填，JSON数组，放1个主任务：[{"name":"干什么","description":"描述","duration_minutes":1,"prompt":"到点后的状态提示"}]。duration_minutes支持小数(0.17=10秒)。
             chain_id(string): action=cancel/advance 时必填。
         """
         session_id = event.unified_msg_origin
@@ -139,21 +155,31 @@ class TaskChainToolPlugin(Star):
                     duration_minutes=total_secs / 60,
                     prompt=prompts[-1] if prompts else tasks_raw[0].prompt,
                 )
-                tasks = [merged]
+
+                # 长任务前插一个互动任务
+                checkin = self._make_checkin(merged)
+                main = ChainTask(
+                    name=merged.name,
+                    description=merged.description,
+                    duration_minutes=total_secs / 60,
+                    prompt=merged.prompt,
+                )
+                tasks = [checkin, main] if checkin else [main]
                 cid = uuid.uuid4().hex[:12]
                 now_t = time.time()
                 chain = TaskChain(
                     id=cid, session_id=session_id, tasks=tasks,
                     created_at=now_t, current_task_started_at=now_t,
-                    current_task_wake_at=now_t + total_secs,
+                    current_task_wake_at=now_t + tasks[0].duration_minutes * 60,
                 )
                 self._chains[cid] = chain
                 self._save_chains()
+                first = tasks[0]
                 wake = datetime.fromtimestamp(chain.current_task_wake_at).strftime("%H:%M:%S")
                 return (
                     f"任务链已创建 (id={cid})。\n"
-                    f"「{merged.name}」{merged.description}\n"
-                    f"预计 {merged.duration_minutes:.1f} 分钟（{wake}）后唤醒。"
+                    f"「{first.name}」{first.description}\n"
+                    f"预计 {first.duration_minutes:.1f} 分钟（{wake}）后唤醒。"
                 )
 
             elif action == "list":
@@ -201,3 +227,47 @@ class TaskChainToolPlugin(Star):
                 return f"阶段「{ct.name}」已完成，任务链全部完成！"
 
             return f"未知操作：{action}"
+
+    # ── 后台自动推进（仅推进链，不发送消息）──
+
+    async def initialize(self) -> None:
+        self._scheduler_task = asyncio.create_task(self._scheduler_loop())
+
+    async def _scheduler_loop(self) -> None:
+        while True:
+            try:
+                await self._tick()
+            except Exception as e:
+                logger.error(f"[TaskChainTool] scheduler: {e}")
+            await asyncio.sleep(10)
+
+    async def _tick(self) -> None:
+        now_t = time.time()
+        to_advance: list[TaskChain] = []
+        async with self._lock:
+            for c in list(self._chains.values()):
+                if not c.is_active or c.is_completed:
+                    continue
+                if now_t >= c.current_task_wake_at:
+                    to_advance.append(c)
+
+        for chain in to_advance:
+            await self._wake_and_advance(chain)
+
+    async def _wake_and_advance(self, chain: TaskChain) -> None:
+        nxt = chain.advance()
+        async with self._lock:
+            if nxt:
+                chain.current_task_started_at = time.time()
+                chain.current_task_wake_at = time.time() + nxt.duration_minutes * 60
+            else:
+                chain.is_active = False
+            self._save_chains()
+
+    async def terminate(self) -> None:
+        if self._scheduler_task:
+            self._scheduler_task.cancel()
+            try:
+                await self._scheduler_task
+            except asyncio.CancelledError:
+                pass
