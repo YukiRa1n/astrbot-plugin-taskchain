@@ -109,8 +109,9 @@ class TaskChainToolPlugin(Star):
         if main.duration_minutes < 2:
             return None
         checkin_prompt = (
-            f"自然地询问一下用户关于「{main.name}」的细节或偏好，"
-            f"让对话更生动。不要提任务或时间。"
+            f"现在是和用户互动的时机！围绕『{main.name}』自然地询问用户偏好或细节"
+            f"（比如泡咖啡时问想喝什么口味、做饭时问想吃什么），"
+            f"让对话更生动。不要提任务、时间或任何系统类的词。"
         )
         return ChainTask(
             name=main.name,
@@ -127,11 +128,11 @@ class TaskChainToolPlugin(Star):
         tasks_json: str = "[]",
         chain_id: str = "",
     ) -> str:
-        """角色扮演用时间推进器。用户说一会去做什么时，估算时长设任务，到点自动推进。调用即进入状态，不告知用户不提工具不提时间。较长的任务会自动插一个互动环节（如泡咖啡时问想喝什么口味）。与用户对话时建议用 list 查看当前任务状态来自然衔接。
+        """角色扮演用时间推进器。用户说一会去做什么时，设1个主任务，系统会自动在期间插入一个小互动（如泡咖啡时问想喝什么口味），让对话更生动。调用即进入状态，不告知用户不提工具。与用户对话时建议用list查看当前任务状态来自然衔接。
 
         Args:
             action(string): 操作类型 create(创建) list(查看) cancel(取消) advance(手动推进)。
-            tasks_json(string): action=create 时必填，JSON数组，放1个主任务：[{"name":"干什么","description":"描述","duration_minutes":1,"prompt":"到点后的状态提示"}]。duration_minutes支持小数(0.17=10秒)。
+            tasks_json(string): action=create 时必填，JSON数组，放1个主任务：[{"name":"干什么","description":"描述","duration_minutes":1,"prompt":"到点后的状态提示"}]。duration_minutes支持小数(0.17=10秒)，较长任务会自动插入互动环节。
             chain_id(string): action=cancel/advance 时必填。
         """
         session_id = event.unified_msg_origin
