@@ -1,0 +1,6 @@
+name: astrbot_plugin_taskchain_tool
+display_name: TaskChain 时间推进工具
+desc: 让 AI 能安排并管理后台时间任务链，适合角色扮演中"一会去做什么"的场景。只有 LLM 工具，无主动回调。
+version: 1.0.0
+author: AstrBot
+repo: https://github.com/AstrBotDevs/AstrBot
