@@ -122,23 +122,12 @@ class TaskChainToolPlugin(Star):
         tasks_json: str = "[]",
         chain_id: str = "",
     ) -> str:
-        """角色扮演用沉浸式时间推进器。当用户说"一会去…"时，为主任务设置时间并自动插入互动环节，让等待感消失、剧情自然流动。调用即进入状态，不要在回复中提及工具、时间安排或任务链。
-
-使用方式（静默调用，每次调用就是一个状态起点）：
-- "我去泡杯咖啡" → 设一个几分钟的泡咖啡主任务，interact 可写"问想喝什么口味/加什么糖"，到点端咖啡回来
-- "先看会书" → 设10-30分钟的阅读，interact 可写"吐槽一下这节好难"或"分享一个有趣的观点"
-- "去学习了" → 设25-45分钟，interact 可写"抱怨一下题目好难我好菜"或"问要不要一起学"
-- "一会吃饭" → 设3-5分钟准备，interact 可写"问问想吃什么"
-
-时长原则：日常小事1-5分钟，长时间活动（学习/看网课/写代码）可适当延长到20-45分钟，但不要过长。interact 可以问问题、吐槽、分享感受、抱怨，让对话有起伏，不要总是客套话。
+        """角色扮演沉浸式时间推进器。用户说一会去做什么时设置任务，自动插入互动环节让等待感消失。调用即进入状态，不在回复中提工具或时间。日常小事设1-5分钟，长时间活动(学习/看网课)可20-45分钟。interact可写问问题、吐槽、抱怨，让对话生动。
 
         Args:
-            action(string): 操作类型: create(创建) list(查看) cancel(取消) advance(手动推进)。
-            tasks_json(string): action=create 时必填, JSON数组, 1个主任务: [{"name":"做什么","description":"描述","duration_minutes":3,"prompt":"到点后的状态提示","interact":"30秒后你想说的话(可选)","interact_duration":0.5}]
-                - duration_minutes: 主任务时长(小数支持, 0.17≈10秒), 日常事情1-5分钟, 长时间活动20-45分钟
-                - interact(可选): 30秒后你想主动说的话, 可以是问问题、吐槽、分享感受
-                - interact_duration(可选): 互动阶段的分钟数, 默认0.5(30秒)
-            chain_id(string): action=cancel/advance 时必填。
+            action(string): 操作类型: create创建 list查看 cancel取消 advance手动推进。
+            tasks_json(string): action=create时必填。JSON数组放1个主任务: [{"name":"做什么","duration_minutes":3,"prompt":"到点状态提示","interact":"期间想说的话(可选)","interact_duration":0.5}]
+            chain_id(string): action=cancel/advance时必填。
         """
         session_id = event.unified_msg_origin
         _MIN_SECONDS = 10
