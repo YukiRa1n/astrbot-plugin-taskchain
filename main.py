@@ -122,11 +122,11 @@ class TaskChainToolPlugin(Star):
         tasks_json: str = "[]",
         chain_id: str = "",
     ) -> str:
-        """角色扮演沉浸式时间推进器。用户说一会去做什么时设置任务，自动插入互动环节让等待感消失。调用即进入状态，不在回复中提工具或时间。日常小事设1-5分钟，长时间活动(学习/看网课)可20-45分钟。interact可写问问题、吐槽、抱怨，让对话生动。
+        """角色扮演沉浸式时间推进器。用户说一会去做什么时设置任务，到点自动唤醒你推进。interact是期间提示词而非逐字稿，AI会自行构思怎么说。调用即进入状态，不在回复中提工具或时间。日常小事1-5分钟，长时间(学习/看网课)可20-45分钟。
 
         Args:
-            action(string): 操作类型: create创建 list查看 cancel取消 advance手动推进。
-            tasks_json(string): action=create时必填。JSON数组放1个主任务: [{"name":"做什么","duration_minutes":3,"prompt":"到点状态提示","interact":"期间想说的话(可选)","interact_duration":0.5}]
+            action(string): create创建 list查看 cancel取消 advance手动推进。
+            tasks_json(string): action=create时必填。JSON数组1个主任务: [{"name":"做什么","duration_minutes":3,"prompt":"到点状态提示","interact":"期间互动提示词(可选)","interact_duration":0.5}]
             chain_id(string): action=cancel/advance时必填。
         """
         session_id = event.unified_msg_origin
@@ -270,62 +270,65 @@ class TaskChainToolPlugin(Star):
             from astrbot.api.message_components import Plain
             from astrbot.api.event import MessageChain as MC
 
+            provider = self.context.get_using_provider()
+            if not provider:
+                return
+
+            # 获取最近对话历史
+            history = []
+            try:
+                conv_mgr = getattr(self.context, "conversation_manager", None)
+                if conv_mgr:
+                    conv = await conv_mgr.get_conversation(
+                        chain.session_id,
+                        self.context.provider_manager.curr_model_objs[0],
+                    )
+                    if conv and conv.history:
+                        history = json.loads(conv.history)[-6:]
+            except Exception:
+                pass
+
             if nxt:
-                # check-in到点：直接把interact内容发出去
-                msg = MC()
-                msg.chain.append(Plain(ct.prompt))
-                await self.context.send_message(chain.session_id, msg)
-            else:
-                # 主任务完成：调LLM生成智能回复
-                provider = self.context.get_using_provider()
-                if not provider:
-                    return
-
-                # 获取最近对话历史
-                history = []
-                try:
-                    conv_mgr = getattr(self.context, "conversation_manager", None)
-                    if conv_mgr:
-                        conv = await conv_mgr.get_conversation(
-                            chain.session_id,
-                            self.context.provider_manager.curr_model_objs[0],
-                        )
-                        if conv and conv.history:
-                            history = json.loads(conv.history)[-6:]  # 最近几条
-                except Exception:
-                    pass
-
-                # 检查用户是否回复了上一条消息
+                # check-in到点：用interact prompt调LLM生成自然回复
                 has_reply = any(
                     m.get("role") == "user"
                     for m in history[-3:] if isinstance(m, dict)
                 )
-
                 system_prompt = (
-                    f"你刚才在做{ct.name}：{ct.description}。"
-                    f"{ct.prompt}\n\n"
+                    f"你刚才说要做{ct.name}，现在时机到了。{ct.prompt}\n\n"
+                    + ("用户刚才和你说了话，自然地结合对话。" if has_reply else "")
+                    + "自然地说出来，不要提任务链、工具或时间。"
+                )
+            else:
+                # 主任务完成：根据用户是否回复了interact来智能回应
+                has_reply = any(
+                    m.get("role") == "user"
+                    for m in history[-5:] if isinstance(m, dict)
+                )
+                system_prompt = (
+                    f"{ct.name}做完了：{ct.prompt}\n\n"
                     + (
-                        "用户刚才回复了你，自然地结合对话继续。"
+                        "用户之前回复了你，自然地结合对话继续。"
                         if has_reply
                         else '用户没有回复你，自行决定结果（比如: 你没回我, 我就按自己想法做了），自然地说出来。'
                     )
                     + "不要提任务链、工具或时间。"
                 )
 
-                result = await provider.text_chat(
-                    prompt="",
-                    session_id=chain.session_id,
-                    contexts=history,
-                    system_prompt=system_prompt,
-                    image_urls=[],
-                )
+            result = await provider.text_chat(
+                prompt="",
+                session_id=chain.session_id,
+                contexts=history,
+                system_prompt=system_prompt,
+                image_urls=[],
+            )
 
-                if result and result.role == "assistant":
-                    text = result.completion_text
-                    if text:
-                        msg = MC()
-                        msg.chain.append(Plain(text))
-                        await self.context.send_message(chain.session_id, msg)
+            if result and result.role == "assistant":
+                text = result.completion_text
+                if text:
+                    msg = MC()
+                    msg.chain.append(Plain(text))
+                    await self.context.send_message(chain.session_id, msg)
         except Exception as e:
             logger.error(f"[TaskChainTool] wake error: {e}")
 
