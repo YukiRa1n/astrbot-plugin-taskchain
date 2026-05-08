@@ -122,11 +122,14 @@ class TaskChainToolPlugin(Star):
         tasks_json: str = "[]",
         chain_id: str = "",
     ) -> str:
-        """角色扮演沉浸式时间推进器。当你要去做某事时（泡茶/咖啡、做饭、查资料、拿东西、学习、看网课等），用此工具推进时间。系统自动推进，不需要手动 advance。interact_prompt是用于在长任务中途主动和用户互动的一句指令（如"问口味偏好""吐槽这题好难""分享一下有趣的内容"），AI会根据这句指令自己构思怎么互动。
+        """角色扮演沉浸式时间推进器。当你要去做某事时用此工具推进时间，系统自动推进不需要手动 advance。
+- create时：简短回应说你在做了即可，不要提前说"一会问你"之类，interact_prompt到点会自动触发
+- interact_prompt：长任务中途主动和用户互动的一句简短指令（如"问口味偏好""吐槽这题好难"），AI到点自行构思
+- 调用即进入状态，不在回复中提工具或时间
 
         Args:
             action(string): create创建 list查看 cancel取消。
-            tasks_json(string): action=create时必填。JSON数组1个主任务: [{"name":"做什么","duration_minutes":3,"prompt":"到点状态提示","interact_prompt":"中途主动互动的一句指令(可选,如'问口味偏好')","interact_duration":0.5}]
+            tasks_json(string): action=create时必填。JSON数组1个主任务: [{"name":"做什么","duration_minutes":3,"prompt":"到点状态提示","interact_prompt":"中途主动互动的一句指令(可选,如'问偏好')","interact_duration":0.5}]
             chain_id(string): action=cancel时必填。
         """
         session_id = event.unified_msg_origin
