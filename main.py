@@ -253,6 +253,7 @@ class TaskChainToolPlugin(Star):
             await self._wake_and_advance(chain)
 
     async def _wake_and_advance(self, chain: TaskChain) -> None:
+        ct = chain.current_task
         nxt = chain.advance()
         async with self._lock:
             if nxt:
@@ -261,6 +262,72 @@ class TaskChainToolPlugin(Star):
             else:
                 chain.is_active = False
             self._save_chains()
+
+        if not ct or not ct.prompt:
+            return
+
+        try:
+            from astrbot.api.message_components import Plain
+            from astrbot.api.event import MessageChain as MC
+
+            if nxt:
+                # check-in到点：直接把interact内容发出去
+                msg = MC()
+                msg.chain.append(Plain(ct.prompt))
+                await self.context.send_message(chain.session_id, msg)
+            else:
+                # 主任务完成：调LLM生成智能回复
+                provider = self.context.get_using_provider()
+                if not provider:
+                    return
+
+                # 获取最近对话历史
+                history = []
+                try:
+                    conv_mgr = getattr(self.context, "conversation_manager", None)
+                    if conv_mgr:
+                        conv = await conv_mgr.get_conversation(
+                            chain.session_id,
+                            self.context.provider_manager.curr_model_objs[0],
+                        )
+                        if conv and conv.history:
+                            history = json.loads(conv.history)[-6:]  # 最近几条
+                except Exception:
+                    pass
+
+                # 检查用户是否回复了上一条消息
+                has_reply = any(
+                    m.get("role") == "user"
+                    for m in history[-3:] if isinstance(m, dict)
+                )
+
+                system_prompt = (
+                    f"你刚才在做{ct.name}：{ct.description}。"
+                    f"{ct.prompt}\n\n"
+                    + (
+                        "用户刚才回复了你，自然地结合对话继续。"
+                        if has_reply
+                        else '用户没有回复你，自行决定结果（比如: 你没回我, 我就按自己想法做了），自然地说出来。'
+                    )
+                    + "不要提任务链、工具或时间。"
+                )
+
+                result = await provider.text_chat(
+                    prompt="",
+                    session_id=chain.session_id,
+                    contexts=history,
+                    system_prompt=system_prompt,
+                    image_urls=[],
+                )
+
+                if result and result.role == "assistant":
+                    text = result.completion_text
+                    if text:
+                        msg = MC()
+                        msg.chain.append(Plain(text))
+                        await self.context.send_message(chain.session_id, msg)
+        except Exception as e:
+            logger.error(f"[TaskChainTool] wake error: {e}")
 
     async def terminate(self) -> None:
         if self._scheduler_task:
