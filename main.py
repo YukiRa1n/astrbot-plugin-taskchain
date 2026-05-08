@@ -104,14 +104,13 @@ class TaskChainToolPlugin(Star):
 
     # ── LLM 工具 ──
 
-    def _make_checkin(self, main: ChainTask, interact_prompt: str = "") -> ChainTask | None:
-        """如果有互动内容，生成一个前置互动任务"""
+    def _make_checkin(self, main: ChainTask, interact_prompt: str = "", interact_duration: float = 0.5) -> ChainTask | None:
         if not interact_prompt or main.duration_minutes < 1:
             return None
         return ChainTask(
             name=main.name,
             description=main.description,
-            duration_minutes=0.5,
+            duration_minutes=interact_duration,
             prompt=interact_prompt,
         )
 
@@ -123,11 +122,22 @@ class TaskChainToolPlugin(Star):
         tasks_json: str = "[]",
         chain_id: str = "",
     ) -> str:
-        """角色扮演用时间推进器。用户说一会去做什么时设1个主任务，可在任务中加 interact 字段来在期间插入主动互动（如泡咖啡时问想喝什么口味），让对话更生动。调用即进入状态，不告知用户不提工具。与用户对话时建议用list查看当前任务状态来自然衔接。
+        """角色扮演用沉浸式时间推进器。当用户说"一会去…"时，为主任务设置时间并自动插入互动环节，让等待感消失、剧情自然流动。调用即进入状态，不要在回复中提及工具、时间安排或任务链。
+
+使用方式（静默调用，每次调用就是一个状态起点）：
+- "我去泡杯咖啡" → 设一个几分钟的泡咖啡主任务，interact 可写"问想喝什么口味/加什么糖"，到点端咖啡回来
+- "先看会书" → 设10-30分钟的阅读，interact 可写"吐槽一下这节好难"或"分享一个有趣的观点"
+- "去学习了" → 设25-45分钟，interact 可写"抱怨一下题目好难我好菜"或"问要不要一起学"
+- "一会吃饭" → 设3-5分钟准备，interact 可写"问问想吃什么"
+
+时长原则：日常小事1-5分钟，长时间活动（学习/看网课/写代码）可适当延长到20-45分钟，但不要过长。interact 可以问问题、吐槽、分享感受、抱怨，让对话有起伏，不要总是客套话。
 
         Args:
-            action(string): 操作类型 create(创建) list(查看) cancel(取消) advance(手动推进)。
-            tasks_json(string): action=create 时必填，JSON数组，放1个主任务：[{"name":"干什么","description":"描述","duration_minutes":1,"prompt":"到点后的状态提示","interact":"你想主动问用户的话（可选）"}]。有interact时会在任务前半段插入互动环节。duration_minutes支持小数(0.17=10秒)。
+            action(string): 操作类型: create(创建) list(查看) cancel(取消) advance(手动推进)。
+            tasks_json(string): action=create 时必填, JSON数组, 1个主任务: [{"name":"做什么","description":"描述","duration_minutes":3,"prompt":"到点后的状态提示","interact":"30秒后你想说的话(可选)","interact_duration":0.5}]
+                - duration_minutes: 主任务时长(小数支持, 0.17≈10秒), 日常事情1-5分钟, 长时间活动20-45分钟
+                - interact(可选): 30秒后你想主动说的话, 可以是问问题、吐槽、分享感受
+                - interact_duration(可选): 互动阶段的分钟数, 默认0.5(30秒)
             chain_id(string): action=cancel/advance 时必填。
         """
         session_id = event.unified_msg_origin
@@ -141,6 +151,7 @@ class TaskChainToolPlugin(Star):
 
                 first = tasks_data[0]
                 interact = first.pop("interact", "")
+                interact_duration = float(first.pop("interact_duration", 0.5))
                 tasks_raw = [ChainTask(**t) for t in tasks_data]
                 for t in tasks_raw:
                     secs = max(t.duration_minutes * 60, _MIN_SECONDS)
@@ -155,7 +166,7 @@ class TaskChainToolPlugin(Star):
                     prompt=prompts[-1] if prompts else tasks_raw[0].prompt,
                 )
 
-                checkin = self._make_checkin(merged, interact)
+                checkin = self._make_checkin(merged, interact, interact_duration)
                 main = ChainTask(
                     name=merged.name,
                     description=merged.description,
