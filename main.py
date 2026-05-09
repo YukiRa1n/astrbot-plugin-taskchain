@@ -347,6 +347,8 @@ class TaskChainToolPlugin(Star):
     # ── LLM 工具 ──
 
     def _make_checkin(self, main: ChainTask) -> ChainTask | None:
+        if not self.config.get("interact_enabled", False):
+            return None
         if main.duration_minutes < 2:
             return None
         duration = random.uniform(0.5, 1.0)
@@ -367,7 +369,7 @@ class TaskChainToolPlugin(Star):
         tasks_json: str = "[]",
         chain_id: str = "",
     ) -> str:
-        """重要：角色做任何事都需要用此工具推进时间。只要你说了要去做一件事（泡茶/咖啡、拿东西、翻行李、烧水、查资料、找材料、等会儿带东西过来等），必须立即调用此工具。这是维持角色扮演沉浸感的核心机制。长任务会自动插入随机互动。create后按人设自然回应，不要说任务已完成。不要空参数调用；如果只是想查看状态，action用list。
+        """重要：角色做任何事都需要用此工具推进时间。只要你说了要去做一件事（泡茶/咖啡、拿东西、翻行李、烧水、查资料、找材料、等会儿带东西过来等），必须立即调用此工具。这是维持角色扮演沉浸感的核心机制。create后按人设自然回应，不要说任务已完成。不要空参数调用；如果只是想查看状态，action用list。
 
         Args:
             action(string): create创建 list查看 cancel取消。默认list，空参数调用只会查看当前任务状态。
@@ -692,6 +694,8 @@ class TaskChainToolPlugin(Star):
 
     async def _followup_check(self, chain: TaskChain, session_id: str, interact_text: str = "") -> None:
         """interact后只监听对应消息；用户没回才概率补一句极短跟进。"""
+        if not self.config.get("interact_enabled", False):
+            return
         await asyncio.sleep(random.uniform(45, 90))
         if chain.is_completed or not chain.is_active:
             return

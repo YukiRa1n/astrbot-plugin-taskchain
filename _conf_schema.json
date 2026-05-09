@@ -1,0 +1,7 @@
+{
+  "interact_enabled": {
+    "type": "bool",
+    "description": "启用中途互动（长任务中主动插入检查点找话题聊天）",
+    "default": false
+  }
+}
