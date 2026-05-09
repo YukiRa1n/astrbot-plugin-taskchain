@@ -299,12 +299,13 @@ class TaskChainToolPlugin(Star):
             "来啦", "端着", "端来", "端上", "递给", "放在", "搁在",
             "倒进杯子", "倒入杯子", "倒进了杯子", "倒进杯里", "杯子里",
             "快好啦", "快好了", "马上就好", "马上就到",
-            "趁热", "小心烫", "您的咖啡", "你的咖啡", "您的茶", "你的茶",
+            "趁热", "小心烫",
         )
         return any(w in text for w in completion_words)
 
     def _safe_in_progress_text(self, task_name: str) -> str:
-        return f"我这边还在{task_name}，博士稍等一下。"
+        # 中性舞台指示语，不含任何人设称呼，避免 OOC
+        return f"*仍在{task_name}中，请稍候……*"
 
     def _looks_like_plain_completion(self, text: str, task_name: str) -> bool:
         normalized = text.strip().strip("。.!！~～")
@@ -320,30 +321,9 @@ class TaskChainToolPlugin(Star):
         )
 
     def _fallback_completion_text(self, task_name: str) -> str:
-        if any(word in task_name for word in ("咖啡", "拿铁")):
-            return (
-                "咖啡好了，博士。刚收尾完，香气还挺足的，"
-                "我先放在你手边，小心烫。"
-            )
-        if any(word in task_name for word in ("茶", "泡茶")):
-            return (
-                "茶泡好了，博士。温度刚好还热着，"
-                "我给你放旁边，慢慢喝。"
-            )
-        if any(word in task_name for word in ("查", "资料", "翻书", "找资料")):
-            return (
-                "我把资料翻完了，博士。刚才对了几处关键内容，"
-                "有一条挺值得展开讲。"
-            )
-        if any(word in task_name for word in ("拿", "带", "取", "找")):
-            return (
-                f"我把{task_name}这事处理好了，博士。东西已经找着了，"
-                "我这就给你看。"
-            )
-        return (
-            f"{task_name}这边已经收尾了，博士。"
-            "我刚确认了一遍，接下来可以继续说结果。"
-        )
+        # 中性舞台指示语，不含任何人设称呼，避免 OOC
+        # 仅在 LLM 完全失败或回复过于机械时作为最后兜底触发
+        return f"*{task_name}已完成。*"
 
     def _parse_task(self, raw: Any) -> ChainTask | None:
         if not isinstance(raw, dict):
@@ -617,7 +597,7 @@ class TaskChainToolPlugin(Star):
                         "可以是很短的回应、轻轻问一个小偏好、顺口吐槽、"
                         "或用角色语气说一句正在做事中的小动静。"
                         "不要固定套模板，不必每次都提问；如果上下文适合安静一点，可以只说短句。"
-                        "参考风格：嗯哼？、我还在忙哦、要加糖吗、这边有点香了。"
+                        "参考风格：短语气词、小偏好确认、做事中的小动静。"
                         "禁止把成品交给用户，禁止说已经做好/完成/端上来/递过去/来啦/趁热/小心烫；"
                         "除非最近一条真实用户消息明确需要确认，否则不要用“没错”“对”“是的”开头；"
                         "不要提任务链、工具、系统提示或具体倒计时。最终只输出一句，尽量简短。"
@@ -762,7 +742,7 @@ class TaskChainToolPlugin(Star):
                             "不要继续追问复杂问题，不要连续推进剧情，不要重复刚才的话。"
                             "任务仍在进行中，不能完成任务，不能把成品交给用户，"
                             "禁止说已经做好/完成/端上来/递过去/来啦/趁热/小心烫。"
-                            "参考短句：喵~、还在吗？、嗯哼？、我还在忙哦。"
+                            "参考短句：极短的语气词或确认存在感。"
                             "最终只输出一句，尽量不超过8个字；不要提任务链、工具或后台。"
                         )
                         result = await provider.text_chat(
