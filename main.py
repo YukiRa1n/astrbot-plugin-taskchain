@@ -25,10 +25,12 @@ MIN_TASK_SECONDS = 10
 
 TOOL_USAGE_SYSTEM_PROMPT = (
     "\n[任务链工具使用规则："
-    "当你要让角色实际去做一件需要等待、稍后才有结果的事，必须主动调用 chain_task。"
-    "触发条件包括用户命令、用户约定、你自己顺着角色扮演构思出的行程，"
-    "以及用户同意了你刚才提出的行动。"
-    "只要角色产生了“我要去做某事/到点做某事/稍后告诉用户”的意图，并且会跨过当前回复，就视为后台任务。"
+    "先按当前角色的人设、关系、情绪和场景判断角色是否愿意实际行动；用户命令本身不等于必须服从。"
+    "如果角色不愿意做、只是在嘴硬拒绝/吐槽/讨价还价/开玩笑，直接按人设回复，不要调用 chain_task。"
+    "只有当你已经决定让角色实际去做一件需要等待、稍后才有结果的事，才必须主动调用 chain_task。"
+    "触发条件包括角色愿意接受的用户请求、双方已经成立的约定、你自己顺着角色扮演构思出的行程，"
+    "以及用户同意了你刚才提出且角色仍愿意执行的行动。"
+    "只要角色产生了“我真的要去做某事/到点做某事/稍后告诉用户”的意图，并且会跨过当前回复，就视为后台任务。"
     "典型动作：泡茶、泡咖啡、做饭、出门散步、洗澡、睡觉/休息、拿东西、去宿舍/厨房/仓库、整理材料、查资料、找物品、稍后带东西过来、稍后给用户看。"
     "典型约定：用户说“一会出门告诉我”“十分钟后提醒我”“等你洗完/散步回来跟我说”“查完资料告诉我”，都要创建任务。"
     "如果用户只给了模糊时间，如“一会儿/等下/晚点”，请按上下文构思一个合理时长；简单动作短一些，出门、洗澡、整理、查资料等可以更久。"
@@ -161,9 +163,12 @@ class TaskChainToolPlugin(Star):
                     + "\n".join(lines)
                     + (
                         f"\n当前仍在进行「{active_task_name}」，还没有完成。"
-                        "用户普通回复时，当前状态已经在这里给出，除非用户明确问状态/剩多久，"
-                        "不要再调用 chain_task list。"
-                        "请直接结合用户回复自然回应，但必须保持任务仍在进行中。"
+                        "这个任务状态只是背景约束，不是每条消息都必须提到的聊天主题。"
+                        "如果用户消息没有明显询问任务、进度、结果，或没有直接延续任务话题，"
+                        "就按正常聊天和人设自然回复，不要强行把表情、语气词、heart、闲聊拉回当前任务。"
+                        "只有用户明确问状态/剩多久/做得怎样，或明显接着任务聊时，才回应任务进度；"
+                        "当前状态已经在这里给出，除非用户明确问状态/剩多久，不要再调用 chain_task list。"
+                        "回应任务相关消息时必须保持任务仍在进行中。"
                         "禁止说快好啦、马上就好、已经倒进杯子、端上来、递给用户、可以喝/尝、完成。"
                         "不要把进度自行推进到最终步骤；偏好问题优先留给中途 interact，"
                         "创建任务后的第一轮不要主动问加奶/加糖/口味。"
@@ -311,37 +316,6 @@ class TaskChainToolPlugin(Star):
         minutes = max(1, int(round(secs / 60)))
         return f"约{minutes}分钟"
 
-    def _looks_like_question(self, text: str) -> bool:
-        question_marks = ("?", "？")
-        question_words = (
-            "要不要", "想不想", "需不需要", "可以吗", "行吗", "好吗",
-            "加糖", "加奶", "怎么", "什么", "哪", "几", "是否", "是不是",
-        )
-        return text.strip().endswith(question_marks) or any(w in text for w in question_words)
-
-    def _looks_like_completion_claim(self, text: str) -> bool:
-        completion_words = (
-            "好了", "做好了", "泡好了", "煮好了", "完成了", "弄好了",
-            "来啦", "端着", "端来", "端上", "递给", "放在", "搁在",
-            "倒进杯子", "倒入杯子", "倒进了杯子", "倒进杯里", "杯子里",
-            "快好啦", "快好了", "马上就好", "马上就到",
-            "趁热", "小心烫",
-        )
-        return any(w in text for w in completion_words)
-
-    def _looks_like_plain_completion(self, text: str, task_name: str) -> bool:
-        normalized = text.strip().strip("。.!！~～")
-        plain_patterns = (
-            f"{task_name}好啦",
-            f"{task_name}好了",
-            f"{task_name}完成了",
-            f"{task_name}弄好了",
-        )
-        return normalized in plain_patterns or (
-            len(normalized) <= len(task_name) + 6
-            and any(word in normalized for word in ("好啦", "好了", "完成了"))
-        )
-
     def _parse_task(self, raw: Any) -> ChainTask | None:
         if not isinstance(raw, dict):
             return None
@@ -389,10 +363,12 @@ class TaskChainToolPlugin(Star):
         """安排或查看角色正在做的后台时间任务。
 
         使用时机：
+        - 先按当前角色的人设、关系、情绪和场景判断角色是否愿意实际行动；用户直接要求不是强制命令。
+        - 如果角色不愿意做、只是在拒绝/吐槽/讨价还价/开玩笑，不要调用，直接按人设回复。
         - 当你准备让角色实际去做一件需要等待的事时，主动调用 action=create。
-        - 这包括用户直接要求、用户约定到点提醒，也包括你自己在对话里提出“我去拿/查/泡/做/整理/散步/洗澡，稍后回来”等行动。
+        - 这包括角色愿意接受的用户请求、用户约定到点提醒，也包括你自己在对话里提出“我去拿/查/泡/做/整理/散步/洗澡，稍后回来”等行动。
         - 只要角色自己想去做某件事、构思了下一段行程，且结果不是当前回复内立即完成，就必须登记成任务。
-        - 如果用户同意了你刚才提出的延迟行动，也要立刻 create，不要只用文字承诺。
+        - 如果用户同意了你刚才提出的延迟行动，且角色仍愿意执行，也要立刻 create，不要只用文字承诺。
         - 用户说“一会出门告诉我”“十分钟后提醒我”“等你回来告诉我”等，就是定时/延迟任务；请顺着上下文安排合理时长。
         - 纯闲聊、假设、回忆、能力说明，且没有真实后台动作时，不要调用。
 
@@ -675,11 +651,6 @@ class TaskChainToolPlugin(Star):
                 )
                 if result and result.role == "assistant":
                     text = result.completion_text or ""
-                    if nxt and self._looks_like_completion_claim(text):
-                        logger.info(f"[TaskChainTool] interact completion claim blocked: {text[:120]}")
-                        text = ""
-                    if not nxt and self._looks_like_plain_completion(text, ct.name):
-                        logger.info(f"[TaskChainTool] plain completion callback returned by provider: {text[:120]}")
             else:
                 logger.warning("[TaskChainTool] no provider for wake callback")
         except Exception as e:
@@ -815,9 +786,6 @@ class TaskChainToolPlugin(Star):
                         if result and result.role == "assistant":
                             text = result.completion_text
                             if text:
-                                if self._looks_like_completion_claim(text):
-                                    logger.info(f"[TaskChainTool] followup completion claim blocked: {text[:120]}")
-                                    return
                                 msg = MC()
                                 msg.chain.append(Plain(text))
                                 await self.context.send_message(session_id, msg)

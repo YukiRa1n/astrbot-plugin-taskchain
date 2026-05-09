@@ -464,7 +464,10 @@ class TestChainTaskTool:
         await plugin._inject_chain_state(mock_event, request)
 
         assert TOOL_USAGE_SYSTEM_PROMPT in request.system_prompt
-        assert "用户同意了你刚才提出的行动" in request.system_prompt
+        assert "用户命令本身不等于必须服从" in request.system_prompt
+        assert "如果角色不愿意做、只是在嘴硬拒绝/吐槽/讨价还价/开玩笑" in request.system_prompt
+        assert "只有当你已经决定让角色实际去做" in request.system_prompt
+        assert "用户同意了你刚才提出且角色仍愿意执行的行动" in request.system_prompt
         assert "你自己顺着角色扮演构思出的行程" in request.system_prompt
         assert "一会出门告诉我" in request.system_prompt
         assert "创建后只自然回应正在开始/正在准备" in request.system_prompt
@@ -518,6 +521,8 @@ class TestChainTaskTool:
         await plugin._inject_chain_state(mock_event, request)
 
         assert "不要再调用 chain_task list" in request.system_prompt
+        assert "任务状态只是背景约束" in request.system_prompt
+        assert "不要强行把表情、语气词、heart、闲聊拉回当前任务" in request.system_prompt
         assert "禁止说快好啦、马上就好、已经倒进杯子" in request.system_prompt
         assert "创建任务后的第一轮不要主动问加奶/加糖/口味" in request.system_prompt
         assert "还需" not in request.system_prompt
@@ -738,7 +743,7 @@ class TestSchedulerTick:
         assert c2.callback_retry_count == 1
 
     @pytest.mark.asyncio
-    async def test_midtask_prompt_forbids_completion_claim(self, plugin):
+    async def test_midtask_prompt_describes_in_progress_constraints(self, plugin):
         now_t = time.time()
         provider_result = MagicMock(role="assistant", completion_text="中途问一句")
         provider = MagicMock()
@@ -910,7 +915,7 @@ class TestSchedulerTick:
         ]
 
     @pytest.mark.asyncio
-    async def test_plain_completion_callback_is_sent_without_fallback_rewrite(self, plugin):
+    async def test_short_completion_callback_is_sent_without_fallback_rewrite(self, plugin):
         now_t = time.time()
         provider_result = MagicMock(role="assistant", completion_text="泡茶好啦！")
         provider = MagicMock()
@@ -979,46 +984,6 @@ class TestSchedulerTick:
         assert chain.current_index == 0
         assert chain.callback_retry_count == 1
         assert chain.completion_callback_at > time.time()
-
-    def test_looks_like_question(self, plugin):
-        assert plugin._looks_like_question("博士要加糖还是加奶？") is True
-        assert plugin._looks_like_question("咖啡豆闻起来很香。") is False
-
-    def test_completion_claim_detection(self, plugin):
-        assert plugin._looks_like_completion_claim("来啦来啦，您的咖啡，小心烫哦。") is True
-        assert plugin._looks_like_completion_claim("我刚把咖啡倒进杯子里，快好啦。") is True
-        assert plugin._looks_like_completion_claim("我还在研磨咖啡豆，博士稍等一下。") is False
-
-    @pytest.mark.asyncio
-    async def test_midtask_completion_claim_is_skipped(self, plugin, monkeypatch):
-        async def no_followup(*_args, **_kwargs):
-            return None
-
-        now_t = time.time()
-        provider_result = MagicMock(role="assistant", completion_text="来啦来啦，您的咖啡！小心烫哦。")
-        provider = MagicMock()
-        provider.text_chat = AsyncMock(return_value=provider_result)
-        plugin.context.get_using_provider.return_value = provider
-        plugin.context.send_message = AsyncMock()
-        monkeypatch.setattr(plugin, "_followup_check", no_followup)
-
-        chain = TaskChain(
-            id="c1", session_id="s1",
-            tasks=[
-                ChainTask(name="泡咖啡", description="", duration_minutes=0.5, prompt=""),
-                ChainTask(name="泡咖啡", description="", duration_minutes=2, prompt=""),
-            ],
-            created_at=now_t,
-            current_task_started_at=now_t,
-            current_task_wake_at=now_t - 1,
-        )
-        plugin._chains["c1"] = chain
-
-        await plugin._wake_and_advance(chain)
-
-        plugin.context.send_message.assert_not_awaited()
-        assert chain.current_index == 1
-        assert chain.is_active is True
 
     @pytest.mark.asyncio
     async def test_followup_prompt_keeps_second_message_short(self, plugin, monkeypatch):
@@ -1137,48 +1102,6 @@ class TestSchedulerTick:
         await plugin._followup_check(chain, "s1", "博士要加糖吗？")
 
         provider.text_chat.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_followup_completion_claim_is_skipped(self, plugin, monkeypatch):
-        plugin.config["interact_enabled"] = True
-        async def no_sleep(_seconds):
-            return None
-
-        monkeypatch.setattr(asyncio, "sleep", no_sleep)
-        monkeypatch.setattr(random, "uniform", lambda _a, _b: 0)
-        monkeypatch.setattr(random, "random", lambda: 0)
-
-        provider_result = MagicMock(role="assistant", completion_text="来啦，您的咖啡已经端上来了。")
-        provider = MagicMock()
-        provider.text_chat = AsyncMock(return_value=provider_result)
-        plugin.context.get_using_provider.return_value = provider
-        plugin.context.send_message = AsyncMock()
-
-        conv = MagicMock()
-        conv.cid = "conv1"
-        conv.history = json.dumps([
-            {"role": "assistant", "content": "咖啡豆闻起来很香。"},
-        ])
-        conv_mgr = MagicMock()
-        conv_mgr.get_conversation = AsyncMock(return_value=conv)
-        conv_mgr.update_conversation = AsyncMock()
-        plugin.context.conversation_manager = conv_mgr
-
-        chain = TaskChain(
-            id="c1",
-            session_id="s1",
-            conversation_id="conv1",
-            tasks=[ChainTask(name="泡咖啡", duration_minutes=2)],
-            created_at=time.time(),
-            current_task_started_at=time.time(),
-            current_task_wake_at=time.time() + 60,
-        )
-
-        await plugin._followup_check(chain, "s1")
-
-        plugin.context.send_message.assert_not_awaited()
-        conv_mgr.update_conversation.assert_not_awaited()
-
 
 # ============================================================
 # 4. 持久化测试
