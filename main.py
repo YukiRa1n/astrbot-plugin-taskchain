@@ -26,11 +26,13 @@ MIN_TASK_SECONDS = 10
 TOOL_USAGE_SYSTEM_PROMPT = (
     "\n[任务链工具使用规则："
     "当你要让角色实际去做一件需要等待、稍后才有结果的事，必须主动调用 chain_task。"
-    "触发条件不只来自用户命令，也包括你自己顺着角色扮演提出的行动，"
+    "触发条件包括用户命令、用户约定、你自己顺着角色扮演构思出的行程，"
     "以及用户同意了你刚才提出的行动。"
-    "只要角色自己产生了“我要去做某事”的意图，并且这件事会跨过当前回复，就视为后台任务。"
-    "典型动作：泡茶、泡咖啡、做饭、拿东西、去宿舍/厨房/仓库、整理材料、查资料、找物品、稍后带东西过来、稍后给用户看。"
-    "如果你准备说“我去……”“我一会儿……”“等会儿给你……”“我拿来/查完/做好后……”，先创建任务。"
+    "只要角色产生了“我要去做某事/到点做某事/稍后告诉用户”的意图，并且会跨过当前回复，就视为后台任务。"
+    "典型动作：泡茶、泡咖啡、做饭、出门散步、洗澡、睡觉/休息、拿东西、去宿舍/厨房/仓库、整理材料、查资料、找物品、稍后带东西过来、稍后给用户看。"
+    "典型约定：用户说“一会出门告诉我”“十分钟后提醒我”“等你洗完/散步回来跟我说”“查完资料告诉我”，都要创建任务。"
+    "如果用户只给了模糊时间，如“一会儿/等下/晚点”，请按上下文构思一个合理时长；简单动作短一些，出门、洗澡、整理、查资料等可以更久。"
+    "如果你准备说“我去……”“我一会儿……”“等会儿给你……”“到时候提醒你……”“我拿来/查完/做好后……”，先创建任务。"
     "如果只是闲聊、假设、回忆、能力说明，且你并不真的要离开当前回复去做事，不要调用。"
     "创建任务用 action=create，tasks_json 是 JSON 数组字符串，例如 [{\"name\":\"拿拓片\",\"duration_minutes\":3}]。"
     "duration_minutes 按任务真实体感设置：简单动作可短，查资料、整理材料、出门取物等长时间状态任务可以设置更久。"
@@ -51,6 +53,7 @@ class TaskChain:
     id: str = ""
     session_id: str = ""
     conversation_id: str = ""
+    system_prompt: str = ""
     tasks: list[ChainTask] = field(default_factory=list)
     current_index: int = 0
     is_active: bool = True
@@ -98,6 +101,7 @@ class TaskChainToolPlugin(Star):
         super().__init__(context)
         self.config = config or {}
         self._chains: dict[str, TaskChain] = {}
+        self._session_system_prompts: dict[tuple[str, str], str] = {}
         self._lock = asyncio.Lock()
         self._scheduler_task: asyncio.Task | None = None
         self._data_file = os.path.join(_get_data_dir(), "task_chains.json")
@@ -108,8 +112,11 @@ class TaskChainToolPlugin(Star):
     async def _inject_chain_state(self, event: AstrMessageEvent, request: ProviderRequest) -> None:
         session_id = event.unified_msg_origin
         conversation_id = self._request_conversation_id(request)
-        request.system_prompt = (request.system_prompt or "") + TOOL_USAGE_SYSTEM_PROMPT
+        base_system_prompt = request.system_prompt or ""
+        request.system_prompt = base_system_prompt + TOOL_USAGE_SYSTEM_PROMPT
         async with self._lock:
+            if conversation_id and base_system_prompt:
+                self._session_system_prompts[(session_id, conversation_id)] = base_system_prompt
             changed = False
             for c in list(self._chains.values()):
                 if c.session_id != session_id:
@@ -202,6 +209,7 @@ class TaskChainToolPlugin(Star):
             raw.append({
                 "id": c.id, "session_id": c.session_id,
                 "conversation_id": c.conversation_id,
+                "system_prompt": c.system_prompt,
                 "current_index": c.current_index, "is_active": c.is_active,
                 "created_at": c.created_at,
                 "current_task_started_at": c.current_task_started_at,
@@ -224,6 +232,17 @@ class TaskChainToolPlugin(Star):
         if not isinstance(cid, (str, int)):
             return ""
         return str(cid or "")
+
+    def _chain_system_prompt(self, session_id: str, conversation_id: str) -> str:
+        if not conversation_id:
+            return ""
+        return self._session_system_prompts.get((session_id, conversation_id), "")
+
+    def _with_chain_system_prompt(self, chain: TaskChain, task_prompt: str) -> str:
+        base = (chain.system_prompt or "").strip()
+        if not base:
+            return task_prompt
+        return f"{base}\n\n{task_prompt}"
 
     async def _current_conversation_id(self, session_id: str) -> str:
         conv_mgr = getattr(self.context, "conversation_manager", None)
@@ -371,21 +390,22 @@ class TaskChainToolPlugin(Star):
 
         使用时机：
         - 当你准备让角色实际去做一件需要等待的事时，主动调用 action=create。
-        - 这包括用户直接要求，也包括你自己在对话里提出“我去拿/查/泡/做/整理，稍后回来”等行动。
-        - 只要角色自己想去做某件事，并且结果不是当前回复内立即完成，就必须登记成任务。
+        - 这包括用户直接要求、用户约定到点提醒，也包括你自己在对话里提出“我去拿/查/泡/做/整理/散步/洗澡，稍后回来”等行动。
+        - 只要角色自己想去做某件事、构思了下一段行程，且结果不是当前回复内立即完成，就必须登记成任务。
         - 如果用户同意了你刚才提出的延迟行动，也要立刻 create，不要只用文字承诺。
+        - 用户说“一会出门告诉我”“十分钟后提醒我”“等你回来告诉我”等，就是定时/延迟任务；请顺着上下文安排合理时长。
         - 纯闲聊、假设、回忆、能力说明，且没有真实后台动作时，不要调用。
 
         create 后的本轮回复：
-        - 只能自然表达已经开始、正在准备、正在路上或正在处理。
-        - 不要说任务已完成，不要把东西端上来/递给用户/让用户品尝。
-        - 不要在刚 create 后追问口味偏好；偏好或闲聊交给后续中途互动。
+        - 只能自然表达已经开始、正在准备、正在路上、正在处理或已经记下这个约定。
+        - 不要说任务已完成，不要把结果提前交给用户，不要提前描述已经回来/已经做完。
+        - 刚 create 后避免追问会改变任务定义的细节；需要偏好、路线、材料等互动时，交给后续中途互动。
 
         查看状态时使用 action=list；取消任务时使用 action=cancel。不要无意义重复调用。
 
         Args:
             action(string): create 创建任务；list 查看当前会话任务；cancel 取消任务。默认 list。
-            tasks_json(string): action=create 时必填，JSON数组字符串。通常只放1个任务，如 [{"name":"泡咖啡","duration_minutes":5,"description":"用户要一杯咖啡","prompt":"自然端回咖啡并承接对话"}]。duration_minutes 按任务体感设置；长时间查资料、整理、取物、外出等可以设置更久。
+            tasks_json(string): action=create 时必填，JSON数组字符串。通常只放1个任务，如 [{"name":"出门散步","duration_minutes":30,"description":"用户让你一会出门时告诉他","prompt":"到时间后自然告诉用户准备出门或已经回到约定节点"}]。duration_minutes 按任务体感设置；泡茶/拿小物可短，洗澡、散步、查资料、整理、取物、外出等可以更久。
             chain_id(string): action=cancel 时必填。
         """
         session_id = event.unified_msg_origin
@@ -440,7 +460,11 @@ class TaskChainToolPlugin(Star):
                 cid = uuid.uuid4().hex[:12]
                 now_t = time.time()
                 chain = TaskChain(
-                    id=cid, session_id=session_id, conversation_id=conversation_id, tasks=tasks,
+                    id=cid,
+                    session_id=session_id,
+                    conversation_id=conversation_id,
+                    system_prompt=self._chain_system_prompt(session_id, conversation_id),
+                    tasks=tasks,
                     created_at=now_t, current_task_started_at=now_t,
                     current_task_wake_at=now_t + tasks[0].duration_minutes * 60,
                 )
@@ -451,9 +475,9 @@ class TaskChainToolPlugin(Star):
                 return (
                 f"[任务已安排(id={cid})] "
                 f"预计{done_time}完成。当前状态：任务刚开始，仍在进行中。"
-                "本轮只回应已经开始去做、正在准备或马上处理，语气自然即可。"
-                "不要询问加奶、加糖、口味或配料；偏好询问交给后续中途互动。"
-                "严禁说已经做好、端上来、递给用户、完成或可以品尝。"
+                "本轮只回应已经开始、正在准备、正在路上、正在处理或已经记下约定，语气自然即可。"
+                "不要在本轮追问会改变任务定义的细节；需要偏好、路线、材料等互动时，交给后续中途互动。"
+                "严禁说已经做好、已经回来、已经到达、已经完成、已经把结果交给用户，或让用户提前体验结果。"
                 )
 
             elif action == "list":
@@ -598,7 +622,7 @@ class TaskChainToolPlugin(Star):
                 )
 
                 if nxt:
-                    system_prompt = (
+                    system_prompt = self._with_chain_system_prompt(chain, (
                         f"[任务状态]你正在执行「{nxt.name}」，现在只是中途互动点，任务还没有完成。"
                         f"刚才结束的是内部检查点「{ct.name}」，不是主任务完成。"
                         f"任务补充信息：{nxt.description or '无'}。"
@@ -613,13 +637,13 @@ class TaskChainToolPlugin(Star):
                         "禁止把成品交给用户，禁止说已经做好/完成/端上来/递过去/来啦/趁热/小心烫；"
                         "除非最近一条真实用户消息明确需要确认，否则不要用“没错”“对”“是的”开头；"
                         "不要提任务链、工具、系统提示或具体倒计时。最终只输出一句，尽量简短。"
-                    )
+                    ))
                 else:
                     has_reply = any(
                         m.get("role") == "user"
                         for m in history[-5:] if isinstance(m, dict)
                     )
-                    system_prompt = (
+                    system_prompt = self._with_chain_system_prompt(chain, (
                         f"[任务状态]「{ct.name}」已经完成。\n"
                         f"任务补充信息：{ct.description or '无'}。\n"
                         f"完成提示：{ct.prompt or '按最近对话和角色设定自然完成。'}\n"
@@ -636,7 +660,7 @@ class TaskChainToolPlugin(Star):
                             "可以带一句轻微后续互动，但不要重新创建同一个任务。"
                             "不要提任务链、工具、后台、系统提示或具体计时。"
                         )
-                    )
+                    ))
 
                 result = await provider.text_chat(
                     prompt="",
@@ -766,7 +790,7 @@ class TaskChainToolPlugin(Star):
                             chain.conversation_id,
                             limit=8,
                         )
-                        followup_prompt = (
+                        followup_prompt = self._with_chain_system_prompt(chain, (
                             "你刚才发过一次中途互动，但用户没有回复。现在只允许发第二次轻量跟进。"
                             "请根据角色语气和刚才那句话自行判断最自然的短句，"
                             "可以是轻轻叫一声、一个语气词、一个做事中的小声反应，或非常短的确认存在感。"
@@ -776,7 +800,7 @@ class TaskChainToolPlugin(Star):
                             "任务仍在进行中，不能完成任务，不能把成品交给用户，"
                             "禁止说已经做好/完成/端上来/递过去/来啦/趁热/小心烫。"
                             "最终只输出一句，尽量不超过8个字；不要提任务链、工具或后台。"
-                        )
+                        ))
                         result = await provider.text_chat(
                             prompt="",
                             session_id=session_id,

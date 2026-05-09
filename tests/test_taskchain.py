@@ -209,8 +209,8 @@ class TestChainTaskTool:
         result = await plugin.chain_task(mock_event, action="create", tasks_json=tasks_json)
         assert "任务已安排" in result
         assert "id=" in result
-        assert "不要询问加奶、加糖、口味或配料" in result
-        assert "偏好询问交给后续中途互动" in result
+        assert "不要在本轮追问会改变任务定义的细节" in result
+        assert "交给后续中途互动" in result
         assert len(plugin._chains) == 1
 
     @pytest.mark.asyncio
@@ -432,6 +432,30 @@ class TestChainTaskTool:
         assert chain.conversation_id == "conv-a"
 
     @pytest.mark.asyncio
+    async def test_create_chain_preserves_current_system_prompt(self, plugin, mock_event):
+        conv_mgr = MagicMock()
+        conv_mgr.get_curr_conversation_id = AsyncMock(return_value="conv-a")
+        plugin.context.conversation_manager = conv_mgr
+
+        request = MagicMock()
+        request.conversation = MagicMock(cid="conv-a", history='[{"role":"user","content":"泡咖啡"}]')
+        request.system_prompt = "# Persona Instructions\n你是佩佩。"
+
+        await plugin._inject_chain_state(mock_event, request)
+        await plugin.chain_task(
+            mock_event,
+            action="create",
+            tasks_json=json.dumps([
+                {"name": "泡咖啡", "description": "泡咖啡", "duration_minutes": 3, "prompt": ""},
+            ]),
+        )
+
+        chain = next(iter(plugin._chains.values()))
+        assert "# Persona Instructions" in chain.system_prompt
+        assert "你是佩佩" in chain.system_prompt
+        assert "任务链工具使用规则" not in chain.system_prompt
+
+    @pytest.mark.asyncio
     async def test_inject_adds_global_tool_usage_rule(self, plugin, mock_event):
         request = MagicMock()
         request.conversation = MagicMock(history='[{"role":"user","content":"你一会打算干什么"}]')
@@ -441,7 +465,8 @@ class TestChainTaskTool:
 
         assert TOOL_USAGE_SYSTEM_PROMPT in request.system_prompt
         assert "用户同意了你刚才提出的行动" in request.system_prompt
-        assert "你自己顺着角色扮演提出的行动" in request.system_prompt
+        assert "你自己顺着角色扮演构思出的行程" in request.system_prompt
+        assert "一会出门告诉我" in request.system_prompt
         assert "创建后只自然回应正在开始/正在准备" in request.system_prompt
 
     @pytest.mark.asyncio
@@ -767,6 +792,34 @@ class TestSchedulerTick:
         system_prompt = provider.text_chat.call_args.kwargs["system_prompt"]
         assert "自然回场" in system_prompt
         assert "不要只说“X好啦/完成了”" in system_prompt
+
+    @pytest.mark.asyncio
+    async def test_completion_callback_includes_persona_system_prompt(self, plugin):
+        now_t = time.time()
+        provider_result = MagicMock(role="assistant", completion_text="咖啡好了。")
+        provider = MagicMock()
+        provider.text_chat = AsyncMock(return_value=provider_result)
+        plugin.context.get_using_provider.return_value = provider
+        plugin.context.send_message = AsyncMock()
+
+        chain = TaskChain(
+            id="c1",
+            session_id="s1",
+            conversation_id="conv1",
+            system_prompt="# Persona Instructions\n你是佩佩，说话要保持角色语气。",
+            tasks=[ChainTask(name="泡咖啡", description="", duration_minutes=1, prompt="")],
+            created_at=now_t,
+            current_task_started_at=now_t,
+            current_task_wake_at=now_t - 1,
+        )
+        plugin._chains["c1"] = chain
+
+        await plugin._wake_and_advance(chain)
+
+        system_prompt = provider.text_chat.call_args.kwargs["system_prompt"]
+        assert "# Persona Instructions" in system_prompt
+        assert "你是佩佩" in system_prompt
+        assert "自然回场" in system_prompt
 
     @pytest.mark.asyncio
     async def test_completion_prompt_includes_task_details(self, plugin):
