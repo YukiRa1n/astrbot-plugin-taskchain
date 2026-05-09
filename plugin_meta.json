@@ -1,0 +1,9 @@
+{
+  "name": "astrbot_plugin_taskchain_tool",
+  "display_name": "TaskChain 角色扮演时间推进",
+  "desc": "让 AI 角色拥有真实时间感。当 AI 说去泡咖啡/做饭/查资料等需要等待的动作时，后台自动创建任务链推进时间，中途会主动互动找话题，到点自然回场。解决了 chatbot 说了就等于做了的沉浸感缺失问题。",
+  "author": "YukiRa1n",
+  "repo": "https://github.com/YukiRa1n/astrbot-plugin-taskchain",
+  "tags": ["角色扮演", "时间推进", "沉浸感", "任务", "互动"],
+  "social_link": "https://github.com/YukiRa1n"
+}
