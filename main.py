@@ -139,14 +139,33 @@ class TaskChainToolPlugin(Star):
                 if c.is_completed:
                     continue
                 lines = []
+                active_task_name = ""
+                active_remain = 0
                 for i, t in enumerate(c.tasks):
                     status = "进行中" if i == c.current_index else ("待开始" if i > c.current_index else "已完成")
                     remain = ""
                     if i == c.current_index and c.is_active and c.current_task:
                         secs = max(0, c.current_task_wake_at - time.time())
+                        active_task_name = t.name
+                        active_remain = int(secs)
                         remain = f"，还需{int(secs//60)}分{int(secs%60)}秒" if secs >= 60 else f"，还需{int(secs)}秒"
                     lines.append(f"  [{i+1}] {t.name}{remain} ({status})")
-                request.system_prompt += "\n[当前任务链：\n" + "\n".join(lines) + "\n]"
+                request.system_prompt += (
+                    "\n[当前任务链：\n"
+                    + "\n".join(lines)
+                    + (
+                        f"\n当前仍在进行「{active_task_name}」，还没有完成。"
+                        "用户普通回复时，当前状态已经在这里给出，除非用户明确问状态/剩多久，"
+                        "不要再调用 chain_task list。"
+                        "请直接结合用户回复自然回应，但必须保持任务仍在进行中。"
+                        "禁止说快好啦、马上就好、已经倒进杯子、端上来、递给用户、可以喝/尝、完成。"
+                        "不要把进度自行推进到最终步骤；偏好问题优先留给中途 interact，"
+                        "创建任务后的第一轮不要主动问加奶/加糖/口味。"
+                        if active_task_name and active_remain > 0
+                        else ""
+                    )
+                    + "\n]"
+                )
             if changed:
                 self._save_chains()
 
@@ -235,9 +254,36 @@ class TaskChainToolPlugin(Star):
             if not conv or not conv.history:
                 return []
             history = json.loads(conv.history)
-            return [m for m in history[-limit:] if isinstance(m, dict)]
+            return self._sanitize_provider_history(history, limit)
         except Exception:
             return []
+
+    def _sanitize_provider_history(self, history: list[Any], limit: int) -> list[dict[str, str]]:
+        cleaned: list[dict[str, str]] = []
+        for msg in history:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                parts = []
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        parts.append(str(item.get("text", "")).strip())
+                    elif isinstance(item, str):
+                        parts.append(item.strip())
+                content = "\n".join(part for part in parts if part)
+            elif content is None:
+                content = ""
+            else:
+                content = str(content)
+            content = content.strip()
+            if not content:
+                continue
+            cleaned.append({"role": str(role), "content": content})
+        return cleaned[-limit:]
 
     def _looks_like_question(self, text: str) -> bool:
         question_marks = ("?", "？")
@@ -251,6 +297,8 @@ class TaskChainToolPlugin(Star):
         completion_words = (
             "好了", "做好了", "泡好了", "煮好了", "完成了", "弄好了",
             "来啦", "端着", "端来", "端上", "递给", "放在", "搁在",
+            "倒进杯子", "倒入杯子", "倒进了杯子", "倒进杯里", "杯子里",
+            "快好啦", "快好了", "马上就好", "马上就到",
             "趁热", "小心烫", "您的咖啡", "你的咖啡", "您的茶", "你的茶",
         )
         return any(w in text for w in completion_words)
@@ -409,7 +457,9 @@ class TaskChainToolPlugin(Star):
                 return (
                     f"[任务已安排(id={cid})] "
                     f"预计{done_time}完成。当前状态：任务刚开始，仍在进行中。"
-                    "本轮只能自然回应“正在去做/正在准备/可以顺口问偏好”，"
+                    "本轮只允许自然回应“正在去做/正在准备/开始处理”，"
+                    "不要询问加奶、加糖、口味、要不要配料等偏好；"
+                    "偏好询问交给后续中途互动。"
                     "严禁说已经做好、端上来、递给用户、完成或可以品尝。"
                 )
 

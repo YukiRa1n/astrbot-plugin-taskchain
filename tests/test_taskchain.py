@@ -209,6 +209,8 @@ class TestChainTaskTool:
         result = await plugin.chain_task(mock_event, action="create", tasks_json=tasks_json)
         assert "任务已安排" in result
         assert "id=" in result
+        assert "不要询问加奶、加糖、口味" in result
+        assert "偏好询问交给后续中途互动" in result
         assert len(plugin._chains) == 1
 
     @pytest.mark.asyncio
@@ -467,6 +469,31 @@ class TestChainTaskTool:
         state_block = request.system_prompt.split("[当前任务链：", 1)[1]
         assert "拿拓片" not in state_block
         assert plugin._chains["conv-b"].is_active is True
+
+    @pytest.mark.asyncio
+    async def test_inject_in_progress_state_forbids_early_completion_and_list(self, plugin, mock_event):
+        now_t = time.time()
+        plugin._chains["conv-a"] = TaskChain(
+            id="conv-a", session_id=mock_event.unified_msg_origin, conversation_id="conv-a",
+            tasks=[
+                ChainTask(name="泡咖啡", duration_minutes=0.5),
+                ChainTask(name="泡咖啡", duration_minutes=4.5),
+            ],
+            current_index=1,
+            created_at=now_t,
+            current_task_started_at=now_t,
+            current_task_wake_at=now_t + 180,
+        )
+
+        request = MagicMock()
+        request.conversation = MagicMock(cid="conv-a", history='[{"role":"user","content":"在呢"}]')
+        request.system_prompt = ""
+
+        await plugin._inject_chain_state(mock_event, request)
+
+        assert "不要再调用 chain_task list" in request.system_prompt
+        assert "禁止说快好啦、马上就好、已经倒进杯子" in request.system_prompt
+        assert "创建任务后的第一轮不要主动问加奶/加糖/口味" in request.system_prompt
 
     @pytest.mark.asyncio
     async def test_reset_only_stops_current_conversation_chain(self, plugin, mock_event):
@@ -789,6 +816,40 @@ class TestSchedulerTick:
         conv_mgr.get_conversations.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_get_recent_history_sanitizes_tool_messages(self, plugin):
+        conv = MagicMock()
+        conv.history = json.dumps([
+            {"role": "user", "content": "帮我泡咖啡"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "call1"}]},
+            {"role": "tool", "tool_call_id": "call1", "content": "任务已安排"},
+            {"role": "assistant", "content": "我去准备。"},
+            {"role": "user", "content": "在呢"},
+        ])
+        conv_mgr = MagicMock()
+        conv_mgr.get_conversation = AsyncMock(return_value=conv)
+        plugin.context.conversation_manager = conv_mgr
+
+        history = await plugin._get_recent_history("s1", "conv1")
+
+        assert history == [
+            {"role": "user", "content": "帮我泡咖啡"},
+            {"role": "assistant", "content": "我去准备。"},
+            {"role": "user", "content": "在呢"},
+        ]
+
+    def test_sanitize_provider_history_handles_text_parts(self, plugin):
+        history = plugin._sanitize_provider_history([
+            {"role": "user", "content": [{"type": "text", "text": "你好"}]},
+            {"role": "assistant", "content": None},
+            {"role": "assistant", "content": [{"type": "text", "text": "在的"}]},
+        ], limit=10)
+
+        assert history == [
+            {"role": "user", "content": "你好"},
+            {"role": "assistant", "content": "在的"},
+        ]
+
+    @pytest.mark.asyncio
     async def test_plain_completion_callback_is_replaced(self, plugin):
         now_t = time.time()
         provider_result = MagicMock(role="assistant", completion_text="泡茶好啦！")
@@ -866,6 +927,7 @@ class TestSchedulerTick:
 
     def test_completion_claim_detection(self, plugin):
         assert plugin._looks_like_completion_claim("来啦来啦，您的咖啡，小心烫哦。") is True
+        assert plugin._looks_like_completion_claim("我刚把咖啡倒进杯子里，快好啦。") is True
         assert plugin._looks_like_completion_claim("我还在研磨咖啡豆，博士稍等一下。") is False
 
     @pytest.mark.asyncio
