@@ -210,8 +210,9 @@ class TestChainTaskTool:
         assert "任务已安排" in result
         assert "id=" in result
         assert "本轮最终回复不能再拒绝" in result
-        assert "本轮最终回复可以留空" in result
+        assert "本轮最终回复优先留空" in result
         assert "不要为了回复而硬说" in result
+        assert "括号动作、舞台说明或重复出发描述" in result
         assert "不要在本轮追问会改变任务定义的细节" in result
         assert "交给后续中途互动" in result
         assert len(plugin._chains) == 1
