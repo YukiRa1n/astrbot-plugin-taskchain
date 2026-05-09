@@ -25,17 +25,16 @@ MIN_TASK_SECONDS = 10
 
 TOOL_USAGE_SYSTEM_PROMPT = (
     "\n[任务链工具使用规则："
-    "当你准备承诺一个需要等待的动作时，必须先调用 chain_task 创建任务，"
-    "再用角色语气自然回应。包括：泡茶、泡咖啡、做饭、拿东西、去宿舍/厨房/仓库、"
-    "整理材料、查资料、找物品、带东西过来、等会儿给用户看等。"
-    "这不只适用于用户命令；如果是你自己临时想做、主动提议、角色自然产生的下一步行动，"
-    "只要会跨过当前回复、需要稍后回来告诉用户结果，也必须创建任务。"
-    "如果你说“等会儿我去……”“我一会儿拿/带/整理/查……”“等用户同意后去做……”，"
-    "或用户已经同意你刚才提出的延迟动作，都属于必须创建任务。"
-    "创建时调用 action=create，tasks_json 必须是 JSON 数组字符串，"
-    "例如 [{\"name\":\"拿拓片\",\"duration_minutes\":3}]。"
-    "不要只在文字里承诺未来动作而不登记任务。"
-    "只有纯粹闲聊、假设、能力说明，且你没有真的准备去做时，才不需要调用。]"
+    "当你要让角色实际去做一件需要等待、稍后才有结果的事，必须主动调用 chain_task。"
+    "触发条件不只来自用户命令，也包括你自己顺着角色扮演提出的行动，"
+    "以及用户同意了你刚才提出的行动。"
+    "只要角色自己产生了“我要去做某事”的意图，并且这件事会跨过当前回复，就视为后台任务。"
+    "典型动作：泡茶、泡咖啡、做饭、拿东西、去宿舍/厨房/仓库、整理材料、查资料、找物品、稍后带东西过来、稍后给用户看。"
+    "如果你准备说“我去……”“我一会儿……”“等会儿给你……”“我拿来/查完/做好后……”，先创建任务。"
+    "如果只是闲聊、假设、回忆、能力说明，且你并不真的要离开当前回复去做事，不要调用。"
+    "创建任务用 action=create，tasks_json 是 JSON 数组字符串，例如 [{\"name\":\"拿拓片\",\"duration_minutes\":3}]。"
+    "duration_minutes 按任务真实体感设置：简单动作可短，查资料、整理材料、出门取物等长时间状态任务可以设置更久。"
+    "创建后只自然回应正在开始/正在准备，不要直接演到完成。]"
 )
 
 
@@ -109,7 +108,7 @@ class TaskChainToolPlugin(Star):
     async def _inject_chain_state(self, event: AstrMessageEvent, request: ProviderRequest) -> None:
         session_id = event.unified_msg_origin
         conversation_id = self._request_conversation_id(request)
-        request.system_prompt += TOOL_USAGE_SYSTEM_PROMPT
+        request.system_prompt = (request.system_prompt or "") + TOOL_USAGE_SYSTEM_PROMPT
         async with self._lock:
             changed = False
             for c in list(self._chains.values()):
@@ -148,7 +147,7 @@ class TaskChainToolPlugin(Star):
                         secs = max(0, c.current_task_wake_at - time.time())
                         active_task_name = t.name
                         active_remain = int(secs)
-                        remain = f"，还需{int(secs//60)}分{int(secs%60)}秒" if secs >= 60 else f"，还需{int(secs)}秒"
+                        remain = f"，{self._coarse_remaining_text(secs)}"
                     lines.append(f"  [{i+1}] {t.name}{remain} ({status})")
                 request.system_prompt += (
                     "\n[当前任务链：\n"
@@ -285,6 +284,14 @@ class TaskChainToolPlugin(Star):
             cleaned.append({"role": str(role), "content": content})
         return cleaned[-limit:]
 
+    def _coarse_remaining_text(self, secs: float) -> str:
+        if secs <= 0:
+            return "等待完成回调"
+        if secs < 60:
+            return "不到1分钟"
+        minutes = max(1, int(round(secs / 60)))
+        return f"约{minutes}分钟"
+
     def _looks_like_question(self, text: str) -> bool:
         question_marks = ("?", "？")
         question_words = (
@@ -303,10 +310,6 @@ class TaskChainToolPlugin(Star):
         )
         return any(w in text for w in completion_words)
 
-    def _safe_in_progress_text(self, task_name: str) -> str:
-        # 中性舞台指示语，不含任何人设称呼，避免 OOC
-        return f"*仍在{task_name}中，请稍候……*"
-
     def _looks_like_plain_completion(self, text: str, task_name: str) -> bool:
         normalized = text.strip().strip("。.!！~～")
         plain_patterns = (
@@ -319,11 +322,6 @@ class TaskChainToolPlugin(Star):
             len(normalized) <= len(task_name) + 6
             and any(word in normalized for word in ("好啦", "好了", "完成了"))
         )
-
-    def _fallback_completion_text(self, task_name: str) -> str:
-        # 中性舞台指示语，不含任何人设称呼，避免 OOC
-        # 仅在 LLM 完全失败或回复过于机械时作为最后兜底触发
-        return f"*{task_name}已完成。*"
 
     def _parse_task(self, raw: Any) -> ChainTask | None:
         if not isinstance(raw, dict):
@@ -369,12 +367,26 @@ class TaskChainToolPlugin(Star):
         tasks_json: str = "[]",
         chain_id: str = "",
     ) -> str:
-        """重要：角色做任何事都需要用此工具推进时间。只要你说了要去做一件事（泡茶/咖啡、拿东西、翻行李、烧水、查资料、找材料、等会儿带东西过来等），必须立即调用此工具。这是维持角色扮演沉浸感的核心机制。create后按人设自然回应，不要说任务已完成。不要空参数调用；如果只是想查看状态，action用list。
+        """安排或查看角色正在做的后台时间任务。
+
+        使用时机：
+        - 当你准备让角色实际去做一件需要等待的事时，主动调用 action=create。
+        - 这包括用户直接要求，也包括你自己在对话里提出“我去拿/查/泡/做/整理，稍后回来”等行动。
+        - 只要角色自己想去做某件事，并且结果不是当前回复内立即完成，就必须登记成任务。
+        - 如果用户同意了你刚才提出的延迟行动，也要立刻 create，不要只用文字承诺。
+        - 纯闲聊、假设、回忆、能力说明，且没有真实后台动作时，不要调用。
+
+        create 后的本轮回复：
+        - 只能自然表达已经开始、正在准备、正在路上或正在处理。
+        - 不要说任务已完成，不要把东西端上来/递给用户/让用户品尝。
+        - 不要在刚 create 后追问口味偏好；偏好或闲聊交给后续中途互动。
+
+        查看状态时使用 action=list；取消任务时使用 action=cancel。不要无意义重复调用。
 
         Args:
-            action(string): create创建 list查看 cancel取消。默认list，空参数调用只会查看当前任务状态。
-            tasks_json(string): action=create时必填，必须是JSON数组字符串。只放1个任务：[{"name":"做什么","duration_minutes":3}]
-            chain_id(string): action=cancel时必填。
+            action(string): create 创建任务；list 查看当前会话任务；cancel 取消任务。默认 list。
+            tasks_json(string): action=create 时必填，JSON数组字符串。通常只放1个任务，如 [{"name":"泡咖啡","duration_minutes":5,"description":"用户要一杯咖啡","prompt":"自然端回咖啡并承接对话"}]。duration_minutes 按任务体感设置；长时间查资料、整理、取物、外出等可以设置更久。
+            chain_id(string): action=cancel 时必填。
         """
         session_id = event.unified_msg_origin
         conversation_id = await self._current_conversation_id(session_id)
@@ -439,8 +451,8 @@ class TaskChainToolPlugin(Star):
                 return (
                 f"[任务已安排(id={cid})] "
                 f"预计{done_time}完成。当前状态：任务刚开始，仍在进行中。"
-                "本轮只允许自然回应\u201c正在去做/正在准备/开始处理\u201d，"
-                "不要主动询问偏好、口味、要不要配料；偏好询问交给后续中途互动。"
+                "本轮只回应已经开始去做、正在准备或马上处理，语气自然即可。"
+                "不要询问加奶、加糖、口味或配料；偏好询问交给后续中途互动。"
                 "严禁说已经做好、端上来、递给用户、完成或可以品尝。"
                 )
 
@@ -587,21 +599,20 @@ class TaskChainToolPlugin(Star):
 
                 if nxt:
                     system_prompt = (
-                        f"[任务状态]你正在执行「{nxt.name}」，当前只到了中途互动点，任务还没有完成。"
+                        f"[任务状态]你正在执行「{nxt.name}」，现在只是中途互动点，任务还没有完成。"
                         f"刚才结束的是内部检查点「{ct.name}」，不是主任务完成。"
                         f"任务补充信息：{nxt.description or '无'}。"
-                        "你只能描述正在准备、等待、调整、寻找、研磨、烧水等进行中动作；"
-                        "不能让物品出现在用户手边，不能让用户品尝，不能给出完成后的结果。"
+                        "你只能描写正在准备、等待、调整、寻找、研磨、烧水等进行中动作；"
+                        "不能让成品出现在用户手边，不能让用户品尝，不能给出完成后的结果。"
                         "最近上下文里的 assistant 消息都是你自己之前说过的话，不是用户的新回复；"
-                        "不要回答、附和或延续自己的上一句，不要像在回复一个不存在的人。"
-                        "请根据最近真实上下文自主决定怎么接这一句："
-                        "可以围绕当前任务找话题——询问偏好、习惯、相关回忆，"
-                        "也可以顺口吐槽、或用角色语气说一句正在做事中的小动静。"
-                        "不要固定套模板，不必每次都提问；如果上下文适合安静一点，可以只说短句。"
-                        "请结合你的人格设定和角色语气自然回应。"
+                        "不要回答、附和或延续自己的上一句，不要像在和不存在的人对话。"
+                        "请根据真实上下文自主决定这一句："
+                        "如果适合互动，可以轻问偏好、习惯或相关小话题；"
+                        "如果不适合提问，可以只说一句做事中的小动静、轻吐槽或短回应。"
+                        "不要固定套模板，不必每次提问；保持角色语气，简短自然。"
                         "禁止把成品交给用户，禁止说已经做好/完成/端上来/递过去/来啦/趁热/小心烫；"
                         "除非最近一条真实用户消息明确需要确认，否则不要用“没错”“对”“是的”开头；"
-                        "不要提任务链、工具、系统提示或具体倒计时。最终只输出一句。"
+                        "不要提任务链、工具、系统提示或具体倒计时。最终只输出一句，尽量简短。"
                     )
                 else:
                     has_reply = any(
@@ -619,10 +630,10 @@ class TaskChainToolPlugin(Star):
                         )
                         + (
                             "你现在是在完成动作后的自然回场，不是在报状态。"
-                            "要写出完成后的具体动作、物品/资料/结果如何交给用户，"
-                            "并保持角色语气和最近对话关系。"
-                            "不要只说“X好啦/完成了”这种机械短句；"
-                            "可以有一句轻微后续互动，但不要重新创建同一个任务。"
+                            "请写出完成后的具体动作、物品/资料/结果如何呈现给用户，"
+                            "并承接最近对话关系。"
+                            "不要只说“X好啦/完成了”这种机械短句；也不要过度铺陈。"
+                            "可以带一句轻微后续互动，但不要重新创建同一个任务。"
                             "不要提任务链、工具、后台、系统提示或具体计时。"
                         )
                     )
@@ -638,18 +649,33 @@ class TaskChainToolPlugin(Star):
                     text = result.completion_text or ""
                     if nxt and self._looks_like_completion_claim(text):
                         logger.info(f"[TaskChainTool] interact completion claim blocked: {text[:120]}")
-                        # text = self._safe_in_progress_text(nxt.name)
+                        text = ""
                     if not nxt and self._looks_like_plain_completion(text, ct.name):
-                        # text = self._fallback_completion_text(ct.name)
-                        pass
+                        logger.info(f"[TaskChainTool] plain completion callback returned by provider: {text[:120]}")
             else:
-                logger.warning("[TaskChainTool] no provider for wake callback; using fallback")
+                logger.warning("[TaskChainTool] no provider for wake callback")
         except Exception as e:
             logger.error(f"[TaskChainTool] wake llm error: {e}")
 
-        # 兜底：LLM失败时发简单消息
         if not text:
-            text = self._safe_in_progress_text(nxt.name) if nxt else self._fallback_completion_text(ct.name)
+            if nxt:
+                logger.info("[TaskChainTool] skip empty/invalid interact callback")
+                return
+            logger.warning("[TaskChainTool] empty completion callback; restore chain for retry")
+            async with self._lock:
+                if chain.id in self._chains:
+                    chain.current_index = prev_index
+                    chain.is_active = prev_active
+                    chain.current_task_started_at = prev_started_at
+                    chain.current_task_wake_at = prev_wake_at
+                    chain.completion_listen_started_at = prev_listen_started_at
+                    chain.completion_callback_at = max(time.time() + 10, prev_callback_at or prev_wake_at)
+                    chain.callback_retry_count = prev_retry_count + 1
+                    if chain.callback_retry_count > 3:
+                        chain.is_active = False
+                        chain.reset_completion_listener()
+                    self._save_chains()
+            return
 
         try:
             msg = MC()
@@ -742,12 +768,13 @@ class TaskChainToolPlugin(Star):
                         )
                         followup_prompt = (
                             "你刚才发过一次中途互动，但用户没有回复。现在只允许发第二次轻量跟进。"
-                            "请由你根据角色语气和刚才那句话自行判断最自然的短句，"
-                            "可以是轻轻叫一声、一个语气词、或非常短的确认存在感。"
-                            "不要继续追问复杂问题，不要连续推进剧情，不要重复刚才的话。"
+                            "请根据角色语气和刚才那句话自行判断最自然的短句，"
+                            "可以是轻轻叫一声、一个语气词、一个做事中的小声反应，或非常短的确认存在感。"
+                            "如果第一次已经问过用户问题，这次不要继续追问；"
+                            "如果第一次只是自言自语，可以轻轻抛出一个很短的互动点。"
+                            "不要连续推进剧情，不要重复刚才的话。"
                             "任务仍在进行中，不能完成任务，不能把成品交给用户，"
                             "禁止说已经做好/完成/端上来/递过去/来啦/趁热/小心烫。"
-                            "参考短句：极短的语气词或确认存在感。"
                             "最终只输出一句，尽量不超过8个字；不要提任务链、工具或后台。"
                         )
                         result = await provider.text_chat(
@@ -762,7 +789,7 @@ class TaskChainToolPlugin(Star):
                             if text:
                                 if self._looks_like_completion_claim(text):
                                     logger.info(f"[TaskChainTool] followup completion claim blocked: {text[:120]}")
-                                    # text = self._safe_in_progress_text(chain.current_task.name if chain.current_task else "处理")
+                                    return
                                 msg = MC()
                                 msg.chain.append(Plain(text))
                                 await self.context.send_message(session_id, msg)

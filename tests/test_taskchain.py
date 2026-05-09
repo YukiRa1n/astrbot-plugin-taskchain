@@ -209,7 +209,7 @@ class TestChainTaskTool:
         result = await plugin.chain_task(mock_event, action="create", tasks_json=tasks_json)
         assert "任务已安排" in result
         assert "id=" in result
-        assert "不要询问加奶、加糖、口味" in result
+        assert "不要询问加奶、加糖、口味或配料" in result
         assert "偏好询问交给后续中途互动" in result
         assert len(plugin._chains) == 1
 
@@ -227,6 +227,7 @@ class TestChainTaskTool:
 
     @pytest.mark.asyncio
     async def test_checkin_does_not_extend_total_duration(self, plugin, mock_event, monkeypatch):
+        plugin.config["interact_enabled"] = True
         monkeypatch.setattr(random, "uniform", lambda _a, _b: 0.5)
         start = 1000.0
         monkeypatch.setattr(time, "time", lambda: start)
@@ -439,9 +440,9 @@ class TestChainTaskTool:
         await plugin._inject_chain_state(mock_event, request)
 
         assert TOOL_USAGE_SYSTEM_PROMPT in request.system_prompt
-        assert "用户已经同意你刚才提出的延迟动作" in request.system_prompt
-        assert "你自己临时想做" in request.system_prompt
-        assert "不要只在文字里承诺未来动作而不登记任务" in request.system_prompt
+        assert "用户同意了你刚才提出的行动" in request.system_prompt
+        assert "你自己顺着角色扮演提出的行动" in request.system_prompt
+        assert "创建后只自然回应正在开始/正在准备" in request.system_prompt
 
     @pytest.mark.asyncio
     async def test_inject_state_is_conversation_scoped(self, plugin, mock_event):
@@ -494,6 +495,8 @@ class TestChainTaskTool:
         assert "不要再调用 chain_task list" in request.system_prompt
         assert "禁止说快好啦、马上就好、已经倒进杯子" in request.system_prompt
         assert "创建任务后的第一轮不要主动问加奶/加糖/口味" in request.system_prompt
+        assert "还需" not in request.system_prompt
+        assert "约" in request.system_prompt or "不到1分钟" in request.system_prompt
 
     @pytest.mark.asyncio
     async def test_reset_only_stops_current_conversation_chain(self, plugin, mock_event):
@@ -633,8 +636,10 @@ class TestSchedulerTick:
         plugin._chains["c1"] = chain
         await plugin._tick()
 
-        assert chain.is_active is False
-        assert chain.is_completed is True
+        assert chain.is_active is True
+        assert chain.current_index == 0
+        assert chain.callback_retry_count == 1
+        assert chain.completion_callback_at > time.time()
 
     @pytest.mark.asyncio
     async def test_tick_skips_inactive(self, plugin):
@@ -702,8 +707,10 @@ class TestSchedulerTick:
         plugin._chains["c1"] = c1
         plugin._chains["c2"] = c2
         await plugin._tick()
-        assert c1.current_index == 1
-        assert c2.current_index == 1
+        assert c1.current_index == 0
+        assert c2.current_index == 0
+        assert c1.callback_retry_count == 1
+        assert c2.callback_retry_count == 1
 
     @pytest.mark.asyncio
     async def test_midtask_prompt_forbids_completion_claim(self, plugin):
@@ -732,8 +739,8 @@ class TestSchedulerTick:
         assert "任务还没有完成" in system_prompt
         assert "禁止把成品交给用户" in system_prompt
         assert "不是用户的新回复" in system_prompt
-        assert "自主决定怎么接这一句" in system_prompt
-        assert "不必每次都提问" in system_prompt
+        assert "自主决定这一句" in system_prompt
+        assert "不必每次提问" in system_prompt
         assert "最终只输出一句，尽量简短" in system_prompt
         assert "不要用“没错”“对”“是的”开头" in system_prompt
 
@@ -850,7 +857,7 @@ class TestSchedulerTick:
         ]
 
     @pytest.mark.asyncio
-    async def test_plain_completion_callback_is_replaced(self, plugin):
+    async def test_plain_completion_callback_is_sent_without_fallback_rewrite(self, plugin):
         now_t = time.time()
         provider_result = MagicMock(role="assistant", completion_text="泡茶好啦！")
         provider = MagicMock()
@@ -871,11 +878,10 @@ class TestSchedulerTick:
 
         sent_chain = plugin.context.send_message.await_args.args[1]
         sent_text = sent_chain.chain[0].text
-        assert sent_text != "泡茶好啦！"
-        assert "茶泡好了" in sent_text
+        assert sent_text == "泡茶好啦！"
 
     @pytest.mark.asyncio
-    async def test_completion_fallback_is_natural_without_provider(self, plugin):
+    async def test_completion_without_provider_restores_chain_for_retry(self, plugin):
         now_t = time.time()
         plugin.context.get_using_provider.return_value = None
         plugin.context.send_message = AsyncMock()
@@ -891,10 +897,10 @@ class TestSchedulerTick:
 
         await plugin._wake_and_advance(chain)
 
-        sent_chain = plugin.context.send_message.await_args.args[1]
-        sent_text = sent_chain.chain[0].text
-        assert sent_text != "翻书找资料好啦！"
-        assert "资料翻完了" in sent_text
+        plugin.context.send_message.assert_not_awaited()
+        assert chain.is_active is True
+        assert chain.current_index == 0
+        assert chain.callback_retry_count == 1
 
     @pytest.mark.asyncio
     async def test_wake_send_failure_restores_chain_for_retry(self, plugin):
@@ -931,7 +937,7 @@ class TestSchedulerTick:
         assert plugin._looks_like_completion_claim("我还在研磨咖啡豆，博士稍等一下。") is False
 
     @pytest.mark.asyncio
-    async def test_midtask_completion_claim_is_replaced(self, plugin, monkeypatch):
+    async def test_midtask_completion_claim_is_skipped(self, plugin, monkeypatch):
         async def no_followup(*_args, **_kwargs):
             return None
 
@@ -957,12 +963,13 @@ class TestSchedulerTick:
 
         await plugin._wake_and_advance(chain)
 
-        sent_chain = plugin.context.send_message.await_args.args[1]
-        sent_text = sent_chain.chain[0].text
-        assert sent_text == "我这边还在泡咖啡，博士稍等一下。"
+        plugin.context.send_message.assert_not_awaited()
+        assert chain.current_index == 1
+        assert chain.is_active is True
 
     @pytest.mark.asyncio
     async def test_followup_prompt_keeps_second_message_short(self, plugin, monkeypatch):
+        plugin.config["interact_enabled"] = True
         async def no_sleep(_seconds):
             return None
 
@@ -1001,7 +1008,7 @@ class TestSchedulerTick:
         system_prompt = provider.text_chat.call_args.kwargs["system_prompt"]
         assert "第二次轻量跟进" in system_prompt
         assert "自行判断最自然的短句" in system_prompt
-        assert "不要继续追问复杂问题" in system_prompt
+        assert "这次不要继续追问" in system_prompt
         assert "任务仍在进行中" in system_prompt
 
     @pytest.mark.asyncio
@@ -1079,7 +1086,8 @@ class TestSchedulerTick:
         provider.text_chat.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_followup_completion_claim_is_replaced(self, plugin, monkeypatch):
+    async def test_followup_completion_claim_is_skipped(self, plugin, monkeypatch):
+        plugin.config["interact_enabled"] = True
         async def no_sleep(_seconds):
             return None
 
@@ -1115,9 +1123,8 @@ class TestSchedulerTick:
 
         await plugin._followup_check(chain, "s1")
 
-        sent_chain = plugin.context.send_message.await_args.args[1]
-        sent_text = sent_chain.chain[0].text
-        assert sent_text == "我这边还在泡咖啡，博士稍等一下。"
+        plugin.context.send_message.assert_not_awaited()
+        conv_mgr.update_conversation.assert_not_awaited()
 
 
 # ============================================================
