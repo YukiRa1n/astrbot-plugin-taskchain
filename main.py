@@ -115,9 +115,9 @@ class TaskChainToolPlugin(Star):
         base_system_prompt = request.system_prompt or ""
         request.system_prompt = base_system_prompt + TOOL_USAGE_SYSTEM_PROMPT
         async with self._lock:
+            changed = False
             if conversation_id and base_system_prompt:
                 self._session_system_prompts[(session_id, conversation_id)] = base_system_prompt
-            changed = False
             for c in list(self._chains.values()):
                 if c.session_id != session_id:
                     continue
