@@ -435,12 +435,11 @@ class TaskChainToolPlugin(Star):
                 main_dur = sum(t.duration_minutes * 60 for t in tasks_raw)
                 done_time = datetime.fromtimestamp(now_t + main_dur).strftime("%H:%M:%S")
                 return (
-                    f"[任务已安排(id={cid})] "
-                    f"预计{done_time}完成。当前状态：任务刚开始，仍在进行中。"
-                    "本轮只允许自然回应“正在去做/正在准备/开始处理”，"
-                    "不要询问加奶、加糖、口味、要不要配料等偏好；"
-                    "偏好询问交给后续中途互动。"
-                    "严禁说已经做好、端上来、递给用户、完成或可以品尝。"
+                f"[任务已安排(id={cid})] "
+                f"预计{done_time}完成。当前状态：任务刚开始，仍在进行中。"
+                "本轮只允许自然回应\u201c正在去做/正在准备/开始处理\u201d，"
+                "不要主动询问偏好、口味、要不要配料；偏好询问交给后续中途互动。"
+                "严禁说已经做好、端上来、递给用户、完成或可以品尝。"
                 )
 
             elif action == "list":
@@ -636,9 +635,11 @@ class TaskChainToolPlugin(Star):
                 if result and result.role == "assistant":
                     text = result.completion_text or ""
                     if nxt and self._looks_like_completion_claim(text):
-                        text = self._safe_in_progress_text(nxt.name)
+                        logger.info(f"[TaskChainTool] interact completion claim blocked: {text[:120]}")
+                        # text = self._safe_in_progress_text(nxt.name)
                     if not nxt and self._looks_like_plain_completion(text, ct.name):
-                        text = self._fallback_completion_text(ct.name)
+                        # text = self._fallback_completion_text(ct.name)
+                        pass
             else:
                 logger.warning("[TaskChainTool] no provider for wake callback; using fallback")
         except Exception as e:
@@ -756,7 +757,8 @@ class TaskChainToolPlugin(Star):
                             text = result.completion_text
                             if text:
                                 if self._looks_like_completion_claim(text):
-                                    text = self._safe_in_progress_text(chain.current_task.name if chain.current_task else "处理")
+                                    logger.info(f"[TaskChainTool] followup completion claim blocked: {text[:120]}")
+                                    # text = self._safe_in_progress_text(chain.current_task.name if chain.current_task else "处理")
                                 msg = MC()
                                 msg.chain.append(Plain(text))
                                 await self.context.send_message(session_id, msg)
