@@ -618,7 +618,26 @@ class TestSchedulerTick:
         plugin._chains = {}
         plugin.context.get_using_provider.return_value = None
         plugin.context.send_message = AsyncMock()
+        plugin.context.get_event_queue.return_value = asyncio.Queue()
         return plugin
+
+    def _attach_source_event(self, plugin, chain):
+        event = MagicMock()
+        event.unified_msg_origin = chain.session_id
+        event.message_obj = MagicMock()
+        event.message_obj.type = "friend"
+        event.message_obj.self_id = "bot"
+        event.message_obj.session_id = chain.session_id
+        event.message_obj.message_id = "123456789"
+        event.message_obj.group = None
+        event.message_obj.sender = MagicMock()
+        event.get_sender_name.return_value = "tester"
+        event.set_extra = MagicMock()
+        plugin._chain_events[chain.id] = event
+        return event
+
+    def _queued_event(self, plugin):
+        return plugin.context.get_event_queue.return_value.get_nowait()
 
     @pytest.mark.asyncio
     async def test_tick_no_chains(self, plugin):
@@ -668,12 +687,14 @@ class TestSchedulerTick:
             current_task_wake_at=now_t - 1,
         )
         plugin._chains["c1"] = chain
+        self._attach_source_event(plugin, chain)
         await plugin._tick()
 
-        assert chain.is_active is True
-        assert chain.current_index == 0
-        assert chain.callback_retry_count == 1
-        assert chain.completion_callback_at > time.time()
+        assert chain.is_active is False
+        assert chain.current_index == 1
+        event = self._queued_event(plugin)
+        assert "「last」已经完成" in event.message_str
+        assert "任务补充信息：最后任务" in event.message_str
 
     @pytest.mark.asyncio
     async def test_tick_skips_inactive(self, plugin):
@@ -740,20 +761,16 @@ class TestSchedulerTick:
         )
         plugin._chains["c1"] = c1
         plugin._chains["c2"] = c2
+        self._attach_source_event(plugin, c1)
+        self._attach_source_event(plugin, c2)
         await plugin._tick()
-        assert c1.current_index == 0
-        assert c2.current_index == 0
-        assert c1.callback_retry_count == 1
-        assert c2.callback_retry_count == 1
+        assert c1.current_index == 1
+        assert c2.current_index == 1
+        assert plugin.context.get_event_queue.return_value.qsize() == 2
 
     @pytest.mark.asyncio
     async def test_midtask_prompt_describes_in_progress_constraints(self, plugin):
         now_t = time.time()
-        provider_result = MagicMock(role="assistant", completion_text="中途问一句")
-        provider = MagicMock()
-        provider.text_chat = AsyncMock(return_value=provider_result)
-        plugin.context.get_using_provider.return_value = provider
-        plugin.context.send_message = AsyncMock()
 
         chain = TaskChain(
             id="c1", session_id="s1",
@@ -766,26 +783,22 @@ class TestSchedulerTick:
             current_task_wake_at=now_t - 1,
         )
         plugin._chains["c1"] = chain
+        self._attach_source_event(plugin, chain)
 
         await plugin._wake_and_advance(chain)
 
-        system_prompt = provider.text_chat.call_args.kwargs["system_prompt"]
-        assert "任务还没有完成" in system_prompt
-        assert "禁止把成品交给用户" in system_prompt
-        assert "不是用户的新回复" in system_prompt
-        assert "自主决定这一句" in system_prompt
-        assert "不必每次提问" in system_prompt
-        assert "最终只输出一句，尽量简短" in system_prompt
-        assert "不要用“没错”“对”“是的”开头" in system_prompt
+        event = self._queued_event(plugin)
+        assert "任务还没有完成" in event.message_str
+        assert "中途互动" in event.message_str
+        assert "自主决定" in event.message_str
+        assert "不要回答你自己上一句" in event.message_str
+        assert "禁止说已经完成" in event.message_str
+        assert event.is_wake is True
+        assert event.is_at_or_wake_command is True
 
     @pytest.mark.asyncio
     async def test_completion_prompt_requires_natural_callback(self, plugin):
         now_t = time.time()
-        provider_result = MagicMock(role="assistant", completion_text="咖啡好了，博士，小心烫。")
-        provider = MagicMock()
-        provider.text_chat = AsyncMock(return_value=provider_result)
-        plugin.context.get_using_provider.return_value = provider
-        plugin.context.send_message = AsyncMock()
 
         chain = TaskChain(
             id="c1", session_id="s1", conversation_id="conv1",
@@ -795,21 +808,18 @@ class TestSchedulerTick:
             current_task_wake_at=now_t - 1,
         )
         plugin._chains["c1"] = chain
+        self._attach_source_event(plugin, chain)
 
         await plugin._wake_and_advance(chain)
 
-        system_prompt = provider.text_chat.call_args.kwargs["system_prompt"]
-        assert "自然回场" in system_prompt
-        assert "不要只说“X好啦/完成了”" in system_prompt
+        event = self._queued_event(plugin)
+        assert "「泡咖啡」已经完成" in event.message_str
+        assert "自然告诉用户完成后的结果" in event.message_str
+        assert "不要只说机械短句" in event.message_str
 
     @pytest.mark.asyncio
-    async def test_completion_callback_includes_persona_system_prompt(self, plugin):
+    async def test_completion_callback_marks_pipeline_event(self, plugin):
         now_t = time.time()
-        provider_result = MagicMock(role="assistant", completion_text="咖啡好了。")
-        provider = MagicMock()
-        provider.text_chat = AsyncMock(return_value=provider_result)
-        plugin.context.get_using_provider.return_value = provider
-        plugin.context.send_message = AsyncMock()
 
         chain = TaskChain(
             id="c1",
@@ -822,22 +832,21 @@ class TestSchedulerTick:
             current_task_wake_at=now_t - 1,
         )
         plugin._chains["c1"] = chain
+        self._attach_source_event(plugin, chain)
 
         await plugin._wake_and_advance(chain)
 
-        system_prompt = provider.text_chat.call_args.kwargs["system_prompt"]
-        assert "# Persona Instructions" in system_prompt
-        assert "你是佩佩" in system_prompt
-        assert "自然回场" in system_prompt
+        event = self._queued_event(plugin)
+        assert event.unified_msg_origin == "s1"
+        assert event.message_obj.message_str == event.message_str
+        assert event.message_obj.session_id == "s1"
+        assert event.message_obj.message_id == "123456789"
+        event.set_extra.assert_any_call("taskchain_callback", True)
+        event.set_extra.assert_any_call("taskchain_callback_kind", "completion")
 
     @pytest.mark.asyncio
     async def test_completion_prompt_includes_task_details(self, plugin):
         now_t = time.time()
-        provider_result = MagicMock(role="assistant", completion_text="资料整理好了。")
-        provider = MagicMock()
-        provider.text_chat = AsyncMock(return_value=provider_result)
-        plugin.context.get_using_provider.return_value = provider
-        plugin.context.send_message = AsyncMock()
 
         chain = TaskChain(
             id="c1", session_id="s1", conversation_id="conv1",
@@ -852,12 +861,13 @@ class TestSchedulerTick:
             current_task_wake_at=now_t - 1,
         )
         plugin._chains["c1"] = chain
+        self._attach_source_event(plugin, chain)
 
         await plugin._wake_and_advance(chain)
 
-        system_prompt = provider.text_chat.call_args.kwargs["system_prompt"]
-        assert "查萨尔贡陶片纹样" in system_prompt
-        assert "讲莲花纹线索" in system_prompt
+        event = self._queued_event(plugin)
+        assert "查萨尔贡陶片纹样" in event.message_str
+        assert "讲莲花纹线索" in event.message_str
 
     @pytest.mark.asyncio
     async def test_get_recent_history_does_not_fallback_without_conversation_id(self, plugin):
@@ -919,12 +929,8 @@ class TestSchedulerTick:
         ]
 
     @pytest.mark.asyncio
-    async def test_short_completion_callback_is_sent_without_fallback_rewrite(self, plugin):
+    async def test_completion_callback_is_queued_without_direct_send(self, plugin):
         now_t = time.time()
-        provider_result = MagicMock(role="assistant", completion_text="泡茶好啦！")
-        provider = MagicMock()
-        provider.text_chat = AsyncMock(return_value=provider_result)
-        plugin.context.get_using_provider.return_value = provider
         plugin.context.send_message = AsyncMock()
 
         chain = TaskChain(
@@ -935,15 +941,16 @@ class TestSchedulerTick:
             current_task_wake_at=now_t - 1,
         )
         plugin._chains["c1"] = chain
+        self._attach_source_event(plugin, chain)
 
         await plugin._wake_and_advance(chain)
 
-        sent_chain = plugin.context.send_message.await_args.args[1]
-        sent_text = sent_chain.chain[0].text
-        assert sent_text == "泡茶好啦！"
+        plugin.context.send_message.assert_not_awaited()
+        event = self._queued_event(plugin)
+        assert "「泡茶」已经完成" in event.message_str
 
     @pytest.mark.asyncio
-    async def test_completion_without_provider_restores_chain_for_retry(self, plugin):
+    async def test_completion_callback_does_not_need_provider(self, plugin):
         now_t = time.time()
         plugin.context.get_using_provider.return_value = None
         plugin.context.send_message = AsyncMock()
@@ -956,22 +963,18 @@ class TestSchedulerTick:
             current_task_wake_at=now_t - 1,
         )
         plugin._chains["c1"] = chain
+        self._attach_source_event(plugin, chain)
 
         await plugin._wake_and_advance(chain)
 
         plugin.context.send_message.assert_not_awaited()
-        assert chain.is_active is True
-        assert chain.current_index == 0
-        assert chain.callback_retry_count == 1
+        assert chain.is_active is False
+        assert chain.current_index == 1
+        assert plugin.context.get_event_queue.return_value.qsize() == 1
 
     @pytest.mark.asyncio
-    async def test_wake_send_failure_restores_chain_for_retry(self, plugin):
+    async def test_missing_source_event_drops_pipeline_callback(self, plugin):
         now_t = time.time()
-        provider_result = MagicMock(role="assistant", completion_text="咖啡好了。")
-        provider = MagicMock()
-        provider.text_chat = AsyncMock(return_value=provider_result)
-        plugin.context.get_using_provider.return_value = provider
-        plugin.context.send_message = AsyncMock(side_effect=RuntimeError("send failed"))
 
         chain = TaskChain(
             id="c1", session_id="s1", conversation_id="conv1",
@@ -984,10 +987,9 @@ class TestSchedulerTick:
 
         await plugin._wake_and_advance(chain)
 
-        assert chain.is_active is True
-        assert chain.current_index == 0
-        assert chain.callback_retry_count == 1
-        assert chain.completion_callback_at > time.time()
+        assert chain.is_active is False
+        assert chain.current_index == 1
+        assert plugin.context.get_event_queue.return_value.qsize() == 0
 
     @pytest.mark.asyncio
     async def test_followup_prompt_keeps_second_message_short(self, plugin, monkeypatch):
@@ -999,10 +1001,6 @@ class TestSchedulerTick:
         monkeypatch.setattr(random, "uniform", lambda _a, _b: 0)
         monkeypatch.setattr(random, "random", lambda: 0)
 
-        provider_result = MagicMock(role="assistant", completion_text="博士？")
-        provider = MagicMock()
-        provider.text_chat = AsyncMock(return_value=provider_result)
-        plugin.context.get_using_provider.return_value = provider
         plugin.context.send_message = AsyncMock()
 
         conv = MagicMock()
@@ -1024,14 +1022,15 @@ class TestSchedulerTick:
             current_task_started_at=time.time(),
             current_task_wake_at=time.time() + 60,
         )
+        self._attach_source_event(plugin, chain)
 
         await plugin._followup_check(chain, "s1")
 
-        system_prompt = provider.text_chat.call_args.kwargs["system_prompt"]
-        assert "第二次轻量跟进" in system_prompt
-        assert "自行判断最自然的短句" in system_prompt
-        assert "这次不要继续追问" in system_prompt
-        assert "任务仍在进行中" in system_prompt
+        event = self._queued_event(plugin)
+        assert "第二次轻量跟进" in event.message_str
+        assert "自行判断最自然的短句" in event.message_str
+        assert "这次不要继续追问" in event.message_str
+        assert "任务还没有完成" in event.message_str
 
     @pytest.mark.asyncio
     async def test_followup_uses_specific_interact_message(self, plugin, monkeypatch):
@@ -1041,10 +1040,6 @@ class TestSchedulerTick:
         monkeypatch.setattr(asyncio, "sleep", no_sleep)
         monkeypatch.setattr(random, "uniform", lambda _a, _b: 0)
         monkeypatch.setattr(random, "random", lambda: 0)
-
-        provider = MagicMock()
-        provider.text_chat = AsyncMock()
-        plugin.context.get_using_provider.return_value = provider
 
         conv = MagicMock()
         conv.cid = "conv1"
@@ -1065,10 +1060,11 @@ class TestSchedulerTick:
             current_task_started_at=time.time(),
             current_task_wake_at=time.time() + 60,
         )
+        self._attach_source_event(plugin, chain)
 
         await plugin._followup_check(chain, "s1", "第一次中途互动")
 
-        provider.text_chat.assert_not_awaited()
+        assert plugin.context.get_event_queue.return_value.qsize() == 0
 
     @pytest.mark.asyncio
     async def test_followup_skips_when_user_replied_after_interact(self, plugin, monkeypatch):
@@ -1078,10 +1074,6 @@ class TestSchedulerTick:
         monkeypatch.setattr(asyncio, "sleep", no_sleep)
         monkeypatch.setattr(random, "uniform", lambda _a, _b: 0)
         monkeypatch.setattr(random, "random", lambda: 0)
-
-        provider = MagicMock()
-        provider.text_chat = AsyncMock()
-        plugin.context.get_using_provider.return_value = provider
 
         conv = MagicMock()
         conv.cid = "conv1"
@@ -1102,10 +1094,11 @@ class TestSchedulerTick:
             current_task_started_at=time.time(),
             current_task_wake_at=time.time() + 60,
         )
+        self._attach_source_event(plugin, chain)
 
         await plugin._followup_check(chain, "s1", "博士要加糖吗？")
 
-        provider.text_chat.assert_not_awaited()
+        assert plugin.context.get_event_queue.return_value.qsize() == 0
 
 # ============================================================
 # 4. 持久化测试

@@ -103,6 +103,7 @@ class TaskChainToolPlugin(Star):
         super().__init__(context)
         self.config = config or {}
         self._chains: dict[str, TaskChain] = {}
+        self._chain_events: dict[str, AstrMessageEvent] = {}
         self._session_system_prompts: dict[tuple[str, str], str] = {}
         self._lock = asyncio.Lock()
         self._scheduler_task: asyncio.Task | None = None
@@ -131,6 +132,7 @@ class TaskChainToolPlugin(Star):
                     or request.conversation.history == "[]"
                 ):
                     c.is_active = False
+                    self._chain_events.pop(c.id, None)
                     changed = True
                     continue
                 if c.completion_callback_at:
@@ -142,6 +144,7 @@ class TaskChainToolPlugin(Star):
                     )
                     c.is_active = False
                     c.reset_completion_listener()
+                    self._chain_events.pop(c.id, None)
                     changed = True
                     continue
                 if c.is_completed:
@@ -242,12 +245,6 @@ class TaskChainToolPlugin(Star):
         if not conversation_id:
             return ""
         return self._session_system_prompts.get((session_id, conversation_id), "")
-
-    def _with_chain_system_prompt(self, chain: TaskChain, task_prompt: str) -> str:
-        base = (chain.system_prompt or "").strip()
-        if not base:
-            return task_prompt
-        return f"{base}\n\n{task_prompt}"
 
     async def _current_conversation_id(self, session_id: str) -> str:
         conv_mgr = getattr(self.context, "conversation_manager", None)
@@ -411,6 +408,7 @@ class TaskChainToolPlugin(Star):
                     ):
                         c.is_active = False
                         c.reset_completion_listener()
+                        self._chain_events.pop(c.id, None)
 
                 for t in tasks_raw:
                     secs = max(t.duration_minutes * 60, MIN_TASK_SECONDS)
@@ -447,6 +445,7 @@ class TaskChainToolPlugin(Star):
                     current_task_wake_at=now_t + tasks[0].duration_minutes * 60,
                 )
                 self._chains[cid] = chain
+                self._chain_events[cid] = event
                 self._save_chains()
                 main_dur = sum(t.duration_minutes * 60 for t in tasks_raw)
                 done_time = datetime.fromtimestamp(now_t + main_dur).strftime("%H:%M:%S")
@@ -495,6 +494,7 @@ class TaskChainToolPlugin(Star):
                 chain = self._chains.get(chain_id)
                 if chain and chain.session_id == session_id and chain.conversation_id == conversation_id:
                     chain.is_active = False
+                    self._chain_events.pop(chain_id, None)
                     self._save_chains()
                     return f"任务链 {chain_id} 已取消。"
                 return f"未找到任务链 {chain_id}。"
@@ -563,6 +563,111 @@ class TaskChainToolPlugin(Star):
         for chain in to_advance:
             await self._wake_and_advance(chain)
 
+    def _build_callback_message_object(self, chain: TaskChain, source_event: AstrMessageEvent, text: str) -> Any:
+        from astrbot.core.message.components import Plain
+        from astrbot.core.platform.astrbot_message import AstrBotMessage
+
+        original = source_event.message_obj
+        msg = AstrBotMessage()
+        msg.type = getattr(original, "type", None)
+        msg.self_id = getattr(original, "self_id", None)
+        msg.session_id = getattr(original, "session_id", None)
+        msg.message_id = self._callback_message_id(original)
+        msg.group = getattr(original, "group", None)
+        msg.sender = getattr(original, "sender", None)
+        msg.message = [Plain(text)]
+        msg.message_str = text
+        msg.raw_message = None
+        msg.timestamp = int(time.time())
+        return msg
+
+    def _callback_message_id(self, original: Any) -> str:
+        message_id = str(getattr(original, "message_id", "") or "")
+        if message_id:
+            try:
+                int(message_id)
+                return message_id
+            except ValueError:
+                pass
+        return str(time.time_ns())
+
+    def _build_callback_event(self, chain: TaskChain, text: str, kind: str) -> AstrMessageEvent | None:
+        import copy
+
+        source_event = self._chain_events.get(chain.id)
+        if not source_event:
+            logger.error(f"[TaskChainTool] no source event for pipeline callback: {chain.id}")
+            return None
+        try:
+            from astrbot.core.utils.trace import TraceSpan
+
+            new_event = copy.copy(source_event)
+            new_event.message_str = text
+            new_event.message_obj = self._build_callback_message_object(chain, source_event, text)
+            new_event._result = None
+            new_event._has_send_oper = False
+            new_event._extras = {}
+            new_event.trace = TraceSpan(
+                name="TaskChainCallback",
+                umo=new_event.unified_msg_origin,
+                sender_name=new_event.get_sender_name(),
+                message_outline=f"[TaskChain {chain.id} {kind}]",
+            )
+            new_event.span = new_event.trace
+            new_event.is_wake = True
+            new_event.is_at_or_wake_command = True
+            new_event.set_extra("taskchain_callback", True)
+            new_event.set_extra("taskchain_chain_id", chain.id)
+            new_event.set_extra("taskchain_callback_kind", kind)
+            return new_event
+        except Exception as e:
+            logger.error(f"[TaskChainTool] build pipeline callback failed: {e}")
+            return None
+
+    def _queue_pipeline_callback(self, chain: TaskChain, text: str, kind: str) -> bool:
+        event = self._build_callback_event(chain, text, kind)
+        if not event:
+            return False
+        try:
+            self.context.get_event_queue().put_nowait(event)
+            return True
+        except Exception as e:
+            logger.error(f"[TaskChainTool] queue pipeline callback failed: {e}")
+            return False
+
+    def _interact_callback_text(self, previous: ChainTask, current: ChainTask) -> str:
+        return (
+            "[TaskChain callback]\n"
+            f"内部检查点「{previous.name}」结束；当前仍在执行「{current.name}」，任务还没有完成。\n"
+            f"任务补充信息：{current.description or '无'}。\n"
+            "请按当前人设和最近上下文生成一句中途互动。"
+            "这句话可以简短询问偏好/习惯/相关小话题，也可以只是做事中的短回应或轻微吐槽；由你根据上下文自主决定。"
+            "不要回答你自己上一句，不要像在和不存在的人对话。"
+            "禁止说已经完成、已经回来、已经把结果交给用户，或让用户提前体验结果。"
+            "不要提任务链、工具、后台或这段提示。"
+        )
+
+    def _completion_callback_text(self, task: ChainTask) -> str:
+        return (
+            "[TaskChain callback]\n"
+            f"「{task.name}」已经完成。\n"
+            f"任务补充信息：{task.description or '无'}。\n"
+            f"完成提示：{task.prompt or '按最近对话和角色设定自然完成。'}\n"
+            "请按当前人设和最近上下文，自然告诉用户完成后的结果。"
+            "不要只说机械短句，不要提任务链、工具、后台或这段提示。"
+        )
+
+    def _followup_callback_text(self, task: ChainTask, interact_text: str) -> str:
+        return (
+            "[TaskChain callback]\n"
+            f"当前仍在执行「{task.name}」，任务还没有完成。\n"
+            f"你刚才的中途互动是：{interact_text or '无'}\n"
+            "用户没有回复，现在只允许发第二次轻量跟进。"
+            "请按当前人设和上下文自行判断最自然的短句；如果第一次已经问过问题，这次不要继续追问；"
+            "如果第一次只是自言自语，可以轻轻抛出一个很短的互动点。"
+            "不要推进到完成，不要重复刚才的话，不要提任务链、工具、后台或这段提示。"
+        )
+
     async def _wake_and_advance(self, chain: TaskChain) -> None:
         async with self._lock:
             if not chain.is_active or chain.is_completed:
@@ -578,151 +683,26 @@ class TaskChainToolPlugin(Star):
                 self._save_chains()
                 return
 
-            prev_index = chain.current_index
-            prev_active = chain.is_active
-            prev_started_at = chain.current_task_started_at
-            prev_wake_at = chain.current_task_wake_at
-            prev_listen_started_at = chain.completion_listen_started_at
-            prev_callback_at = chain.completion_callback_at
-            prev_retry_count = chain.callback_retry_count
             nxt = chain.advance()
             if nxt:
                 chain.current_task_started_at = time.time()
                 chain.current_task_wake_at = time.time() + nxt.duration_minutes * 60
+                callback_text = self._interact_callback_text(ct, nxt)
+                callback_kind = "interact"
             else:
                 chain.is_active = False
+                callback_text = self._completion_callback_text(ct)
+                callback_kind = "completion"
             chain.reset_completion_listener()
             self._save_chains()
 
-        from astrbot.api.message_components import Plain
-        from astrbot.api.event import MessageChain as MC
-
-        text = ""
-
-        # 调LLM生成回复
-        try:
-            provider = self.context.get_using_provider()
-            if provider:
-                history = await self._get_recent_history(
-                    chain.session_id,
-                    chain.conversation_id,
-                )
-
-                if nxt:
-                    system_prompt = self._with_chain_system_prompt(chain, (
-                        f"[任务状态]你正在执行「{nxt.name}」，现在只是中途互动点，任务还没有完成。"
-                        f"刚才结束的是内部检查点「{ct.name}」，不是主任务完成。"
-                        f"任务补充信息：{nxt.description or '无'}。"
-                        "你只能描写正在准备、等待、调整、寻找、研磨、烧水等进行中动作；"
-                        "不能让成品出现在用户手边，不能让用户品尝，不能给出完成后的结果。"
-                        "最近上下文里的 assistant 消息都是你自己之前说过的话，不是用户的新回复；"
-                        "不要回答、附和或延续自己的上一句，不要像在和不存在的人对话。"
-                        "请根据真实上下文自主决定这一句："
-                        "如果适合互动，可以轻问偏好、习惯或相关小话题；"
-                        "如果不适合提问，可以只说一句做事中的小动静、轻吐槽或短回应。"
-                        "不要固定套模板，不必每次提问；保持角色语气，简短自然。"
-                        "禁止把成品交给用户，禁止说已经做好/完成/端上来/递过去/来啦/趁热/小心烫；"
-                        "除非最近一条真实用户消息明确需要确认，否则不要用“没错”“对”“是的”开头；"
-                        "不要提任务链、工具、系统提示或具体倒计时。最终只输出一句，尽量简短。"
-                    ))
-                else:
-                    has_reply = any(
-                        m.get("role") == "user"
-                        for m in history[-5:] if isinstance(m, dict)
-                    )
-                    system_prompt = self._with_chain_system_prompt(chain, (
-                        f"[任务状态]「{ct.name}」已经完成。\n"
-                        f"任务补充信息：{ct.description or '无'}。\n"
-                        f"完成提示：{ct.prompt or '按最近对话和角色设定自然完成。'}\n"
-                        + (
-                            "用户之前回复过你，请结合最近对话自然延续，并给出完成后的结果。"
-                            if has_reply
-                            else "用户没有继续回复，请自行决定一个合理结果并自然说出来。"
-                        )
-                        + (
-                            "你现在是在完成动作后的自然回场，不是在报状态。"
-                            "请写出完成后的具体动作、物品/资料/结果如何呈现给用户，"
-                            "并承接最近对话关系。"
-                            "不要只说“X好啦/完成了”这种机械短句；也不要过度铺陈。"
-                            "可以带一句轻微后续互动，但不要重新创建同一个任务。"
-                            "不要提任务链、工具、后台、系统提示或具体计时。"
-                        )
-                    ))
-
-                result = await provider.text_chat(
-                    prompt="",
-                    session_id=chain.session_id,
-                    contexts=history,
-                    system_prompt=system_prompt,
-                    image_urls=[],
-                )
-                if result and result.role == "assistant":
-                    text = result.completion_text or ""
-            else:
-                logger.warning("[TaskChainTool] no provider for wake callback")
-        except Exception as e:
-            logger.error(f"[TaskChainTool] wake llm error: {e}")
-
-        if not text:
-            if nxt:
-                logger.info("[TaskChainTool] skip empty/invalid interact callback")
-                return
-            logger.warning("[TaskChainTool] empty completion callback; restore chain for retry")
-            async with self._lock:
-                if chain.id in self._chains:
-                    chain.current_index = prev_index
-                    chain.is_active = prev_active
-                    chain.current_task_started_at = prev_started_at
-                    chain.current_task_wake_at = prev_wake_at
-                    chain.completion_listen_started_at = prev_listen_started_at
-                    chain.completion_callback_at = max(time.time() + 10, prev_callback_at or prev_wake_at)
-                    chain.callback_retry_count = prev_retry_count + 1
-                    if chain.callback_retry_count > 3:
-                        chain.is_active = False
-                        chain.reset_completion_listener()
-                    self._save_chains()
-            return
-
-        try:
-            msg = MC()
-            msg.chain.append(Plain(text))
-            await self.context.send_message(chain.session_id, msg)
-        except Exception as e:
-            logger.error(f"[TaskChainTool] wake send error: {e}")
-            async with self._lock:
-                if chain.id in self._chains:
-                    chain.current_index = prev_index
-                    chain.is_active = prev_active
-                    chain.current_task_started_at = prev_started_at
-                    chain.current_task_wake_at = prev_wake_at
-                    chain.completion_listen_started_at = prev_listen_started_at
-                    chain.completion_callback_at = max(time.time() + 10, prev_callback_at or prev_wake_at)
-                    chain.callback_retry_count = prev_retry_count + 1
-                    if chain.callback_retry_count > 3:
-                        chain.is_active = False
-                        chain.reset_completion_listener()
-                    self._save_chains()
-            return
-
-        # 存进对话历史。写历史失败不能恢复任务，否则已发送的回调会重复。
-        try:
-            conv_mgr = getattr(self.context, "conversation_manager", None)
-            if conv_mgr and chain.conversation_id:
-                conv = await conv_mgr.get_conversation(chain.session_id, chain.conversation_id)
-                if conv:
-                    hist = json.loads(conv.history) if conv.history else []
-                    hist.append({"role": "assistant", "content": text})
-                    await conv_mgr.update_conversation(
-                        chain.session_id,
-                        conversation_id=conv.cid,
-                        history=hist,
-                    )
-        except Exception as e:
-            logger.warning(f"[TaskChainTool] wake history update failed: {e}")
-
-        # 如果是interact触发，安排后续检查
+        queued = self._queue_pipeline_callback(chain, callback_text, callback_kind)
+        if not queued:
+            logger.error(f"[TaskChainTool] pipeline callback dropped: {chain.id}/{callback_kind}")
         if nxt:
-            asyncio.create_task(self._followup_check(chain, chain.session_id, text))
+            asyncio.create_task(self._followup_check(chain, chain.session_id))
+        else:
+            self._chain_events.pop(chain.id, None)
 
     async def _followup_check(self, chain: TaskChain, session_id: str, interact_text: str = "") -> None:
         """interact后只监听对应消息；用户没回才概率补一句极短跟进。"""
@@ -762,46 +742,15 @@ class TaskChainToolPlugin(Star):
                 has_user_reply = any(m.get("role") == "user" for m in after if isinstance(m, dict))
                 has_later_assistant = any(m.get("role") == "assistant" for m in after if isinstance(m, dict))
                 if not has_user_reply and not has_later_assistant and random.random() < FOLLOWUP_PROBABILITY:
-                    from astrbot.api.message_components import Plain
-                    from astrbot.api.event import MessageChain as MC
-                    provider = self.context.get_using_provider()
-                    if provider:
-                        interact_text = str(hist[interact_idx].get("content", ""))
-                        context_history = await self._get_recent_history(
-                            session_id,
-                            chain.conversation_id,
-                            limit=8,
-                        )
-                        followup_prompt = self._with_chain_system_prompt(chain, (
-                            "你刚才发过一次中途互动，但用户没有回复。现在只允许发第二次轻量跟进。"
-                            "请根据角色语气和刚才那句话自行判断最自然的短句，"
-                            "可以是轻轻叫一声、一个语气词、一个做事中的小声反应，或非常短的确认存在感。"
-                            "如果第一次已经问过用户问题，这次不要继续追问；"
-                            "如果第一次只是自言自语，可以轻轻抛出一个很短的互动点。"
-                            "不要连续推进剧情，不要重复刚才的话。"
-                            "任务仍在进行中，不能完成任务，不能把成品交给用户，"
-                            "禁止说已经做好/完成/端上来/递过去/来啦/趁热/小心烫。"
-                            "最终只输出一句，尽量不超过8个字；不要提任务链、工具或后台。"
-                        ))
-                        result = await provider.text_chat(
-                            prompt="",
-                            session_id=session_id,
-                            contexts=context_history,
-                            system_prompt=followup_prompt,
-                            image_urls=[],
-                        )
-                        if result and result.role == "assistant":
-                            text = result.completion_text
-                            if text:
-                                msg = MC()
-                                msg.chain.append(Plain(text))
-                                await self.context.send_message(session_id, msg)
-                                hist.append({"role": "assistant", "content": text})
-                                await conv_mgr.update_conversation(
-                                    session_id,
-                                    conversation_id=conv.cid,
-                                    history=hist,
-                                )
+                    task = chain.current_task
+                    if not task:
+                        return
+                    text = self._followup_callback_text(
+                        task,
+                        str(hist[interact_idx].get("content", "")),
+                    )
+                    if not self._queue_pipeline_callback(chain, text, "followup"):
+                        logger.error(f"[TaskChainTool] followup pipeline callback dropped: {chain.id}")
         except Exception as e:
             logger.warning(f"[TaskChainTool] followup check failed: {e}")
 
