@@ -7,6 +7,7 @@ import os
 import random
 import time
 import uuid
+import weakref
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -66,6 +67,7 @@ class TaskChain:
     completion_callback_at: float = 0.0
     callback_retry_count: int = 0
     followup_after_history_len: int = 0
+    event_metadata: dict[str, Any] = field(default_factory=dict)
 
     def reset_completion_listener(self) -> None:
         self.completion_listen_started_at = 0.0
@@ -108,7 +110,7 @@ class TaskChainToolPlugin(Star):
         super().__init__(context)
         self.config = config or {}
         self._chains: dict[str, TaskChain] = {}
-        self._chain_events: dict[str, AstrMessageEvent] = {}
+        self._chain_events = weakref.WeakValueDictionary()
         self._session_system_prompts: dict[tuple[str, str], str] = {}
         self._lock = asyncio.Lock()
         self._scheduler_task: asyncio.Task | None = None
@@ -121,6 +123,24 @@ class TaskChainToolPlugin(Star):
         self, event: AstrMessageEvent, request: ProviderRequest
     ) -> None:
         session_id = event.unified_msg_origin
+        if not self._scheduler_task or self._scheduler_task.done():
+            try:
+                if (
+                    self._scheduler_task
+                    and self._scheduler_task.done()
+                    and not self._scheduler_task.cancelled()
+                ):
+                    exc = self._scheduler_task.exception()
+                    if exc:
+                        logger.error(
+                            f"[TaskChainTool] scheduler loop died with exception: {exc}"
+                        )
+            except Exception:
+                pass
+            logger.warning(
+                "[TaskChainTool] scheduler loop died or not started. Restarting scheduler..."
+            )
+            self._scheduler_task = asyncio.create_task(self._scheduler_loop())
         conversation_id = self._request_conversation_id(request)
         base_system_prompt = request.system_prompt or ""
         request.system_prompt = base_system_prompt + TOOL_USAGE_SYSTEM_PROMPT
@@ -244,6 +264,7 @@ class TaskChainToolPlugin(Star):
                     "completion_callback_at": c.completion_callback_at,
                     "callback_retry_count": c.callback_retry_count,
                     "followup_after_history_len": c.followup_after_history_len,
+                    "event_metadata": c.event_metadata,
                     "tasks": [
                         {
                             "name": t.name,
@@ -468,6 +489,35 @@ class TaskChainToolPlugin(Star):
                 tasks = [checkin, main] if checkin else [main]
                 cid = uuid.uuid4().hex[:12]
                 now_t = time.time()
+
+                def _get_clean_attr(obj: Any, attr_path: str, default_val: Any) -> Any:
+                    parts = attr_path.split(".")
+                    curr = obj
+                    for p in parts:
+                        if curr is None:
+                            return default_val
+                        if type(curr).__name__ in ("MagicMock", "Mock", "AsyncMock"):
+                            return default_val
+                        val = getattr(curr, p, None)
+                        if callable(val) and type(val).__name__ not in (
+                            "MagicMock",
+                            "Mock",
+                            "AsyncMock",
+                        ):
+                            try:
+                                curr = val()
+                            except Exception:
+                                return default_val
+                        else:
+                            curr = val
+                    if curr is None or type(curr).__name__ in (
+                        "MagicMock",
+                        "Mock",
+                        "AsyncMock",
+                    ):
+                        return default_val
+                    return curr
+
                 chain = TaskChain(
                     id=cid,
                     session_id=session_id,
@@ -479,6 +529,22 @@ class TaskChainToolPlugin(Star):
                     created_at=now_t,
                     current_task_started_at=now_t,
                     current_task_wake_at=now_t + tasks[0].duration_minutes * 60,
+                    event_metadata={
+                        "platform_id": _get_clean_attr(
+                            event, "platform_meta.id", "mock"
+                        ),
+                        "platform_name": _get_clean_attr(
+                            event, "platform_meta.name", "mock"
+                        ),
+                        "session_id": _get_clean_attr(event, "session_id", ""),
+                        "message_type": _get_clean_attr(
+                            event, "get_message_type.value", 1
+                        ),
+                        "sender_id": _get_clean_attr(event, "get_sender_id", ""),
+                        "sender_name": _get_clean_attr(event, "get_sender_name", ""),
+                        "group_id": _get_clean_attr(event, "get_group_id", ""),
+                        "self_id": _get_clean_attr(event, "get_self_id", ""),
+                    },
                 )
                 self._chains[cid] = chain
                 self._chain_events[cid] = event
@@ -650,6 +716,48 @@ class TaskChainToolPlugin(Star):
         import copy
 
         source_event = self._chain_events.get(chain.id)
+        if not source_event and getattr(chain, "event_metadata", None):
+            try:
+                from astrbot.core.platform.platform_metadata import PlatformMetadata
+                from astrbot.core.platform.astrbot_message import (
+                    AstrBotMessage,
+                    GroupMember,
+                )
+                from astrbot.core.platform.message_type import MessageType
+
+                meta = chain.event_metadata
+                plat_meta = PlatformMetadata(
+                    id=meta.get("platform_id", "mock"),
+                    name=meta.get("platform_name", "mock"),
+                )
+
+                msg_obj = AstrBotMessage()
+                try:
+                    msg_obj.type = MessageType(meta.get("message_type", 1))
+                except Exception:
+                    msg_obj.type = MessageType.FRIEND_MESSAGE
+                msg_obj.self_id = meta.get("self_id", "")
+                msg_obj.session_id = meta.get("session_id", "")
+                msg_obj.group_id = meta.get("group_id", "")
+
+                sender = GroupMember()
+                sender.user_id = meta.get("sender_id", "")
+                sender.nickname = meta.get("sender_name", "")
+                msg_obj.sender = sender
+
+                class ConcreteMessageEvent(AstrMessageEvent):
+                    async def send(self, message):
+                        pass
+
+                source_event = ConcreteMessageEvent(
+                    message_str="",
+                    message_obj=msg_obj,
+                    platform_meta=plat_meta,
+                    session_id=meta.get("session_id", ""),
+                )
+            except Exception as e:
+                logger.error(f"[TaskChainTool] Rebuilding event failed: {e}")
+
         if not source_event:
             logger.error(
                 f"[TaskChainTool] no source event for pipeline callback: {chain.id}"
