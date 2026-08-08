@@ -1,4 +1,9 @@
 {
+  "single_reply_mode": {
+    "type": "bool",
+    "description": "创建任务时合并工具调用前后回复，确保同一轮最多发送一段 AI 文本。为能在工具执行后去重，开启时普通 LLM 回复统一使用非流式输出",
+    "default": true
+  },
   "interact_enabled": {
     "type": "bool",
     "description": "启用中途互动（长任务中主动插入检查点找话题聊天）",

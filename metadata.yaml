@@ -2,7 +2,7 @@ name: astrbot_plugin_taskchain_tool
 display_name: TaskChain 角色沉浸扮演
 desc: 让 AI 角色拥有真实时间感与主动感。后台自动创建任务链推进时间，中途主动找话题互动，到点回调，自然回复
 short_desc: 为 AI 角色赋予真实时间感与主动感，让角色扮演中的等待不再空洞
-version: 1.0.0
+version: 1.1.0
 author: YukiRa1n
 repo: https://github.com/YukiRa1n/astrbot-plugin-taskchain
 astrbot_version: ">=4.24.2"

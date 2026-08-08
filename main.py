@@ -7,22 +7,34 @@ import os
 import random
 import time
 import uuid
-import weakref
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from astrbot.api import logger
-from astrbot.api.event import AstrMessageEvent
-from astrbot.api.event.filter import on_llm_request
+from astrbot.api import llm_tool, logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event.filter import (
+    after_message_sent,
+    on_decorating_result,
+    on_llm_request,
+)
 from astrbot.api.provider import ProviderRequest
-from astrbot.api.star import Context, Star, register
-from astrbot.api import llm_tool
-
+from astrbot.api.star import Context, Star
+from astrbot.core.cron.events import CronMessageEvent
+from astrbot.core.platform.message_session import MessageSession
 
 COMPLETION_LISTEN_SECONDS = 10
 FOLLOWUP_PROBABILITY = 0.5
 MIN_TASK_SECONDS = 10
+CALLBACK_ACK_TIMEOUT_SECONDS = 120
+MAX_CALLBACK_PIPELINE_ATTEMPTS = 3
+PROMPT_CACHE_TTL_SECONDS = 3600
+
+_PRE_TOOL_REPLY_KEY = "taskchain_pre_tool_reply"
+_CREATE_SUCCEEDED_KEY = "taskchain_create_succeeded"
+_SUPPRESS_POST_REPLY_KEY = "taskchain_suppress_post_reply"
+_CALLBACK_TOKEN_KEY = "taskchain_callback_token"
+_SINGLE_REPLY_MODE_ENABLED = True
 
 TOOL_USAGE_SYSTEM_PROMPT = (
     "\n[任务链工具使用规则："
@@ -37,6 +49,8 @@ TOOL_USAGE_SYSTEM_PROMPT = (
     "如果用户只给了模糊时间，如“一会儿/等下/晚点”，请按上下文构思一个合理时长；简单动作短一些，出门、洗澡、整理、查资料等可以更久。"
     "如果你准备说“我去……”“我一会儿……”“等会儿给你……”“到时候提醒你……”“我拿来/查完/做好后……”，先创建任务。"
     "如果只是闲聊、假设、回忆、能力说明，且你并不真的要离开当前回复去做事，不要调用。"
+    "同一轮只能向用户展示一段自然语言：更推荐先静默调用工具，再在工具成功后完整回复一次；"
+    "如果调用工具前已经输出过自然回复，工具成功后必须结束本轮，不要再输出确认、同义改写或动作描写。"
     '创建任务用 action=create，tasks_json 是 JSON 数组字符串，例如 [{"name":"拿拓片","duration_minutes":3}]。'
     "duration_minutes 按任务真实体感设置：简单动作可短，查资料、整理材料、出门取物等长时间状态任务可以设置更久。"
     "创建后只自然回应正在开始/正在准备，不要直接演到完成。]"
@@ -66,13 +80,22 @@ class TaskChain:
     completion_listen_started_at: float = 0.0
     completion_callback_at: float = 0.0
     callback_retry_count: int = 0
+    callback_retry_at: float = 0.0
+    pending_callback_kind: str = ""
+    pending_callback_token: str = ""
     followup_after_history_len: int = 0
+    finished_at: float = 0.0
     event_metadata: dict[str, Any] = field(default_factory=dict)
 
     def reset_completion_listener(self) -> None:
         self.completion_listen_started_at = 0.0
         self.completion_callback_at = 0.0
+
+    def reset_callback_delivery(self) -> None:
         self.callback_retry_count = 0
+        self.callback_retry_at = 0.0
+        self.pending_callback_kind = ""
+        self.pending_callback_token = ""
 
     @property
     def current_task(self) -> ChainTask | None:
@@ -104,38 +127,194 @@ def _get_data_dir() -> str:
         )
 
 
-@register("TaskChainTool", "AstrBot", "让 AI 能安排并管理后台时间任务链", "1.0.0")
+class _PrepareSingleReplyFilter(filter.CustomFilter):
+    """在唤醒判定阶段关闭流式输出，但不激活消息处理器。"""
+
+    def filter(self, event: AstrMessageEvent, _config: Any) -> bool:
+        if _SINGLE_REPLY_MODE_ENABLED:
+            event.set_extra("enable_streaming", False)
+        # 只利用过滤阶段准备事件；False 可避免插件因此唤醒所有群消息。
+        return False
+
+
+class _ReliableCronMessageEvent(CronMessageEvent):
+    """让主动发送失败可被确认钩子识别。"""
+
+    async def send(self, message) -> None:
+        if message is None:
+            return
+        sent = await self.context_obj.send_message(self.session, message)
+        if not sent:
+            self.set_extra("taskchain_delivery_failed", True)
+            raise RuntimeError(f"cannot send callback to session {self.session}")
+        await AstrMessageEvent.send(self, message)
+
+
 class TaskChainToolPlugin(Star):
     def __init__(self, context: Context, config: dict[str, Any] | None = None) -> None:
+        global _SINGLE_REPLY_MODE_ENABLED
+
         super().__init__(context)
         self.config = config or {}
+        _SINGLE_REPLY_MODE_ENABLED = self.config.get("single_reply_mode", True)
         self._chains: dict[str, TaskChain] = {}
-        self._chain_events = weakref.WeakValueDictionary()
+        self._chain_events: dict[str, Any] = {}
         self._session_system_prompts: dict[tuple[str, str], str] = {}
+        self._session_prompt_seen_at: dict[tuple[str, str], float] = {}
         self._lock = asyncio.Lock()
         self._scheduler_task: asyncio.Task | None = None
+        self._followup_tasks: set[asyncio.Task] = set()
+        self._session_index: dict[str, list[str]] = {}
         self._data_file = os.path.join(_get_data_dir(), "task_chains.json")
         os.makedirs(os.path.dirname(self._data_file), exist_ok=True)
         self._load_chains()
+
+    def _index_chain(self, chain: TaskChain) -> None:
+        ids = self._session_index.setdefault(chain.session_id, [])
+        if chain.id not in ids:
+            ids.append(chain.id)
+
+    def _deindex_chain(self, chain: TaskChain) -> None:
+        ids = self._session_index.get(chain.session_id)
+        if not ids:
+            return
+        self._session_index[chain.session_id] = [
+            chain_id for chain_id in ids if chain_id != chain.id
+        ]
+        if not self._session_index[chain.session_id]:
+            self._session_index.pop(chain.session_id, None)
+
+    def _deactivate_chain(self, chain: TaskChain, *, now: float | None = None) -> None:
+        chain.is_active = False
+        chain.finished_at = now or time.time()
+        chain.reset_completion_listener()
+        chain.reset_callback_delivery()
+        self._chain_events.pop(chain.id, None)
+        self._deindex_chain(chain)
+
+    def _active_chains_for_session(self, session_id: str) -> list[TaskChain]:
+        """返回会话的活动任务，并修复可能残留的索引项。
+
+        调用方必须持有 ``self._lock``。索引只保存活动任务；当旧版本数据或
+        异常流程导致索引缺失时，才回退到全量扫描进行一次自愈。
+        """
+        indexed_ids = self._session_index.get(session_id, [])
+        active = [
+            chain
+            for chain_id in dict.fromkeys(indexed_ids)
+            if (chain := self._chains.get(chain_id))
+            and chain.session_id == session_id
+            and chain.is_active
+            and not chain.is_completed
+        ]
+        valid_ids = [chain.id for chain in active]
+
+        if indexed_ids:
+            if valid_ids != indexed_ids:
+                if valid_ids:
+                    self._session_index[session_id] = valid_ids
+                else:
+                    self._session_index.pop(session_id, None)
+            if active:
+                return active
+
+        active = [
+            chain
+            for chain in self._chains.values()
+            if chain.session_id == session_id
+            and chain.is_active
+            and not chain.is_completed
+        ]
+        if active:
+            self._session_index[session_id] = [chain.id for chain in active]
+        return active
+
+    @filter.custom_filter(_PrepareSingleReplyFilter, priority=-100000)
+    async def _prepare_single_reply(self, _event: AstrMessageEvent) -> None:
+        """该处理器不会执行；其过滤器负责在管道构建前准备事件。"""
+
+    @on_decorating_result(priority=-100001)
+    async def _discard_stale_callback_reply(self, event: AstrMessageEvent) -> None:
+        """发送前再次校验回调令牌，避免超时重试产生重复消息。"""
+        if event.get_extra("taskchain_callback", False) is not True:
+            return
+        token = str(event.get_extra(_CALLBACK_TOKEN_KEY, "") or "")
+        if not token:
+            return
+        chain_id = str(event.get_extra("taskchain_chain_id", "") or "")
+        async with self._lock:
+            chain = self._chains.get(chain_id)
+            is_current = bool(
+                chain and chain.is_active and chain.pending_callback_token == token
+            )
+        if is_current:
+            return
+
+        result = event.get_result()
+        if result:
+            result.chain.clear()
+        logger.info(
+            f"[TaskChainTool] stale callback reply discarded: {chain_id}/{token}"
+        )
+
+    @on_decorating_result(priority=-100000)
+    async def _consolidate_create_reply(self, event: AstrMessageEvent) -> None:
+        """同一轮 create 只保留工具前或工具后的第一段可见回复。"""
+        if not self.config.get("single_reply_mode", True):
+            return
+        if event.get_extra("taskchain_callback", False) is True:
+            return
+        result = event.get_result()
+        if not result or not result.is_llm_result():
+            return
+
+        try:
+            from astrbot.api.event import MessageChain
+
+            text = MessageChain(chain=list(result.chain)).get_plain_text().strip()
+        except Exception:
+            text = ""
+
+        if event.get_extra(_CREATE_SUCCEEDED_KEY, False) is True:
+            if event.get_extra(_SUPPRESS_POST_REPLY_KEY, False) is True:
+                result.chain.clear()
+                logger.debug("[TaskChainTool] suppressed duplicate post-create reply")
+            return
+
+        if text:
+            event.set_extra(_PRE_TOOL_REPLY_KEY, text)
 
     @on_llm_request()
     async def _inject_chain_state(
         self, event: AstrMessageEvent, request: ProviderRequest
     ) -> None:
+        if event.get_extra("taskchain_callback", False) is True:
+            chain_id = str(event.get_extra("taskchain_chain_id", "") or "")
+            token = str(event.get_extra(_CALLBACK_TOKEN_KEY, "") or "")
+            async with self._lock:
+                chain = self._chains.get(chain_id)
+                is_current = bool(
+                    chain and chain.is_active and chain.pending_callback_token == token
+                )
+            if token and not is_current:
+                logger.info(
+                    f"[TaskChainTool] stale callback discarded: {chain_id}/{token}"
+                )
+                event.stop_event()
+            return
+
         session_id = event.unified_msg_origin
         if not self._scheduler_task or self._scheduler_task.done():
             try:
                 if (
                     self._scheduler_task
-                    and self._scheduler_task.done()
                     and not self._scheduler_task.cancelled()
+                    and (exc := self._scheduler_task.exception())
                 ):
-                    exc = self._scheduler_task.exception()
-                    if exc:
-                        logger.error(
-                            f"[TaskChainTool] scheduler loop died with exception: {exc}"
-                        )
-            except Exception:
+                    logger.error(
+                        f"[TaskChainTool] scheduler loop died with exception: {exc}"
+                    )
+            except (asyncio.CancelledError, Exception):
                 pass
             logger.warning(
                 "[TaskChainTool] scheduler loop died or not started. Restarting scheduler..."
@@ -149,12 +328,10 @@ class TaskChainToolPlugin(Star):
         async with self._lock:
             changed = False
             if conversation_id and base_system_prompt:
-                self._session_system_prompts[(session_id, conversation_id)] = (
-                    base_system_prompt
-                )
-            for c in list(self._chains.values()):
-                if c.session_id != session_id:
-                    continue
+                prompt_key = (session_id, conversation_id)
+                self._session_system_prompts[prompt_key] = base_system_prompt
+                self._session_prompt_seen_at[prompt_key] = time.time()
+            for c in self._active_chains_for_session(session_id):
                 if c.conversation_id != conversation_id:
                     continue
                 # 新对话/reset时清理当前会话任务；不会影响同一用户的其他会话。
@@ -162,23 +339,21 @@ class TaskChainToolPlugin(Star):
                     not request.conversation.history
                     or request.conversation.history == "[]"
                 ):
-                    c.is_active = False
-                    self._chain_events.pop(c.id, None)
+                    self._deactivate_chain(c)
                     changed = True
                     continue
-                if c.completion_callback_at:
+                is_last_task = c.current_index == len(c.tasks) - 1
+                if is_last_task and (
+                    c.completion_callback_at or time.time() >= c.current_task_wake_at
+                ):
                     task_name = c.current_task.name if c.current_task else "当前任务"
                     request.system_prompt += (
                         f"\n[当前任务链：{task_name}已完成。"
                         "用户在完成监听期内回复了你，请直接自然地给出完成后的结果，"
                         "不要再等待后台提醒，不要提任务链、工具或时间。]"
                     )
-                    c.is_active = False
-                    c.reset_completion_listener()
-                    self._chain_events.pop(c.id, None)
+                    self._deactivate_chain(c)
                     changed = True
-                    continue
-                if c.is_completed:
                     continue
                 lines = []
                 active_task_name = ""
@@ -216,7 +391,7 @@ class TaskChainToolPlugin(Star):
                     + "\n]"
                 )
             if changed:
-                self._save_chains()
+                await self._save_chains_async()
 
     # ── 持久化 ──
 
@@ -224,30 +399,57 @@ class TaskChainToolPlugin(Star):
         try:
             with open(self._data_file, encoding="utf-8") as f:
                 raw = json.load(f)
-            now_t = time.time()
-            for c in raw:
-                if not isinstance(c, dict):
-                    continue
-                if now_t - c.get("current_task_wake_at", 0) > 300:
-                    continue
-                tasks = [self._parse_task(t) for t in c.pop("tasks", [])]
-                tasks = [t for t in tasks if t]
+        except FileNotFoundError:
+            return
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.error(f"[TaskChainTool] load chains failed: {exc}")
+            self._chains = {}
+            self._session_index = {}
+            return
+
+        if not isinstance(raw, list):
+            logger.error("[TaskChainTool] invalid persistence root: expected list")
+            return
+
+        now_t = time.time()
+        allowed = set(TaskChain.__dataclass_fields__)
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            try:
+                record = dict(item)
+                tasks = [self._parse_task(t) for t in record.pop("tasks", [])]
+                tasks = [task for task in tasks if task]
                 if not tasks:
                     continue
-                allowed = set(TaskChain.__dataclass_fields__)
-                chain_data = {k: v for k, v in c.items() if k in allowed}
+                chain_data = {k: v for k, v in record.items() if k in allowed}
                 if not chain_data.get("id"):
                     continue
-                current_index = int(chain_data.get("current_index", 0) or 0)
-                if current_index < 0:
-                    current_index = 0
+                current_index = max(0, int(chain_data.get("current_index", 0) or 0))
                 chain_data["current_index"] = min(current_index, len(tasks))
-                self._chains[chain_data["id"]] = TaskChain(**chain_data, tasks=tasks)
-        except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError):
-            self._chains = {}
+                loaded = TaskChain(**chain_data, tasks=tasks)
 
-    def _save_chains(self) -> None:
-        raw = []
+                # 活动任务即使已逾期也要恢复，由调度器补偿执行。
+                expiry_base = loaded.finished_at or max(
+                    loaded.current_task_wake_at,
+                    loaded.created_at,
+                )
+                if not loaded.is_active and expiry_base and now_t - expiry_base > 600:
+                    continue
+                if loaded.is_active and loaded.pending_callback_kind:
+                    loaded.callback_retry_at = min(
+                        loaded.callback_retry_at or now_t,
+                        now_t,
+                    )
+
+                self._chains[loaded.id] = loaded
+                if loaded.is_active and not loaded.is_completed:
+                    self._index_chain(loaded)
+            except (TypeError, ValueError) as exc:
+                logger.warning(f"[TaskChainTool] skipped invalid chain record: {exc}")
+
+    def _serialize_chains(self) -> list[dict[str, Any]]:
+        raw: list[dict[str, Any]] = []
         for c in self._chains.values():
             raw.append(
                 {
@@ -263,7 +465,11 @@ class TaskChainToolPlugin(Star):
                     "completion_listen_started_at": c.completion_listen_started_at,
                     "completion_callback_at": c.completion_callback_at,
                     "callback_retry_count": c.callback_retry_count,
+                    "callback_retry_at": c.callback_retry_at,
+                    "pending_callback_kind": c.pending_callback_kind,
+                    "pending_callback_token": c.pending_callback_token,
                     "followup_after_history_len": c.followup_after_history_len,
+                    "finished_at": c.finished_at,
                     "event_metadata": c.event_metadata,
                     "tasks": [
                         {
@@ -276,8 +482,37 @@ class TaskChainToolPlugin(Star):
                     ],
                 }
             )
-        with open(self._data_file, "w", encoding="utf-8") as f:
-            json.dump(raw, f, ensure_ascii=False, indent=2)
+        return raw
+
+    def _write_chains(self, raw: list[dict[str, Any]]) -> None:
+        tmp_path = f"{self._data_file}.{uuid.uuid4().hex}.tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(raw, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self._data_file)
+        finally:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+
+    def _save_chains(self) -> None:
+        """同步保存入口，主要用于初始化和测试。"""
+        try:
+            self._write_chains(self._serialize_chains())
+        except (OSError, TypeError, ValueError) as exc:
+            logger.error(f"[TaskChainTool] failed to save chains: {exc}")
+
+    async def _save_chains_async(self) -> None:
+        """锁内生成不可变快照，在线程中完成原子落盘。"""
+        raw = self._serialize_chains()
+        try:
+            await asyncio.to_thread(self._write_chains, raw)
+        except (OSError, TypeError, ValueError) as exc:
+            logger.error(f"[TaskChainTool] failed to save chains: {exc}")
 
     def _request_conversation_id(self, request: ProviderRequest) -> str:
         conv = getattr(request, "conversation", None)
@@ -372,6 +607,8 @@ class TaskChainToolPlugin(Star):
             duration = 10
         if not math.isfinite(duration) or duration <= 0:
             duration = MIN_TASK_SECONDS / 60
+        if duration > 1440:
+            duration = 1440
         return ChainTask(
             name=name or "当前任务",
             description=description,
@@ -395,6 +632,220 @@ class TaskChainToolPlugin(Star):
             duration_minutes=duration,
             prompt="",
         )
+
+    def _parse_create_tasks(self, tasks_json: str) -> tuple[list[ChainTask], str]:
+        if not isinstance(tasks_json, str):
+            return [], "错误：tasks_json 不是合法 JSON。"
+        if len(tasks_json) > 65536:
+            return [], "错误：tasks_json 过大（>64KB）。"
+        try:
+            tasks_data = json.loads(tasks_json)
+        except json.JSONDecodeError:
+            return [], "错误：tasks_json 不是合法 JSON。"
+        if not isinstance(tasks_data, list):
+            return [], "错误：tasks_json 必须是 JSON 数组。"
+        if len(tasks_data) > 50:
+            return [], "错误：任务列表过长，最多 50 个。"
+
+        tasks = [task for raw in tasks_data if (task := self._parse_task(raw))]
+        if not tasks:
+            return [], "错误：任务列表不能为空。"
+        for task in tasks:
+            task.duration_minutes = (
+                max(task.duration_minutes * 60, MIN_TASK_SECONDS) / 60
+            )
+        return tasks, ""
+
+    def _build_scheduled_tasks(
+        self, source_tasks: list[ChainTask]
+    ) -> tuple[list[ChainTask], float]:
+        total_secs = sum(task.duration_minutes * 60 for task in source_tasks)
+        merged = ChainTask(
+            name=source_tasks[0].name,
+            description=source_tasks[0].description,
+            duration_minutes=total_secs / 60,
+            prompt=next(
+                (task.prompt for task in reversed(source_tasks) if task.prompt),
+                source_tasks[0].prompt,
+            ),
+        )
+        checkin = self._make_checkin(merged)
+        main_secs = total_secs
+        if checkin:
+            main_secs = max(
+                MIN_TASK_SECONDS,
+                total_secs - checkin.duration_minutes * 60,
+            )
+        main = ChainTask(
+            name=merged.name,
+            description=merged.description,
+            duration_minutes=main_secs / 60,
+            prompt=merged.prompt,
+        )
+        return ([checkin, main] if checkin else [main]), total_secs
+
+    @staticmethod
+    def _event_attr(event: AstrMessageEvent, attr_path: str, default: Any) -> Any:
+        current: Any = event
+        for part in attr_path.split("."):
+            if current is None or type(current).__module__ == "unittest.mock":
+                return default
+            value = getattr(current, part, None)
+            if callable(value) and type(value).__module__ != "unittest.mock":
+                try:
+                    current = value()
+                except Exception:
+                    return default
+            else:
+                current = value
+        if current is None or type(current).__module__ == "unittest.mock":
+            return default
+        return current
+
+    def _event_metadata(self, event: AstrMessageEvent) -> dict[str, Any]:
+        return {
+            "platform_id": self._event_attr(event, "platform_meta.id", "mock"),
+            "platform_name": self._event_attr(event, "platform_meta.name", "mock"),
+            "session_id": self._event_attr(event, "session_id", ""),
+            "message_type": self._event_attr(event, "get_message_type.value", 1),
+            "sender_id": self._event_attr(event, "get_sender_id", ""),
+            "sender_name": self._event_attr(event, "get_sender_name", ""),
+            "group_id": self._event_attr(event, "get_group_id", ""),
+            "self_id": self._event_attr(event, "get_self_id", ""),
+        }
+
+    async def _create_chain_locked(
+        self,
+        event: AstrMessageEvent,
+        session_id: str,
+        conversation_id: str,
+        tasks_json: str,
+    ) -> str:
+        if not conversation_id:
+            return "错误：当前会话尚未初始化，无法创建后台任务。请先按当前人设自然回复，不要创建任务。"
+
+        source_tasks, error = self._parse_create_tasks(tasks_json)
+        if error:
+            return error
+        for chain in self._active_chains_for_session(session_id):
+            if chain.conversation_id == conversation_id:
+                self._deactivate_chain(chain)
+
+        tasks, total_secs = self._build_scheduled_tasks(source_tasks)
+        chain_id = uuid.uuid4().hex[:12]
+        now_t = time.time()
+        chain = TaskChain(
+            id=chain_id,
+            session_id=session_id,
+            conversation_id=conversation_id,
+            system_prompt=self._chain_system_prompt(session_id, conversation_id),
+            tasks=tasks,
+            created_at=now_t,
+            current_task_started_at=now_t,
+            current_task_wake_at=now_t + tasks[0].duration_minutes * 60,
+            event_metadata=self._event_metadata(event),
+        )
+        self._chains[chain_id] = chain
+        self._index_chain(chain)
+        self._chain_events[chain_id] = event
+        await self._save_chains_async()
+
+        pre_tool_reply = event.get_extra(_PRE_TOOL_REPLY_KEY, "")
+        if not isinstance(pre_tool_reply, str):
+            pre_tool_reply = ""
+        suppress_post_reply = bool(
+            self.config.get("single_reply_mode", True) and pre_tool_reply.strip()
+        )
+        event.set_extra(_CREATE_SUCCEEDED_KEY, True)
+        event.set_extra(_SUPPRESS_POST_REPLY_KEY, suppress_post_reply)
+
+        done_time = datetime.fromtimestamp(now_t + total_secs).strftime("%H:%M:%S")
+        reply_instruction = (
+            "你在工具调用前的自然回复已经展示给用户。"
+            "本轮最终输出必须为空，不要再补充确认、动作描写或同义句。"
+            if suppress_post_reply
+            else (
+                "你在工具调用前没有向用户展示自然回复。"
+                "本轮最终只输出一段简短、完整的人设回复，表达已经开始行动或记下约定。"
+            )
+        )
+        return (
+            f"[任务已安排(id={chain_id})] "
+            f"预计{done_time}完成。当前状态：任务刚开始，仍在进行中。"
+            + reply_instruction
+            + "你已经创建任务，表示角色已经愿意执行；本轮最终回复不能再拒绝、否认行动、说没空/不去，"
+            "也不要让用户自己去做。"
+            "不要在本轮追问会改变任务定义的细节；需要偏好、路线、材料等互动时，交给后续中途互动。"
+            "严禁说已经做好、已经回来、已经到达、已经完成、已经把结果交给用户，或让用户提前体验结果。"
+        )
+
+    def _list_chains_locked(self, session_id: str, conversation_id: str) -> str:
+        active = [
+            chain
+            for chain in self._active_chains_for_session(session_id)
+            if chain.conversation_id == conversation_id
+        ]
+        lines = []
+        for chain in active:
+            task = chain.current_task
+            if not task:
+                continue
+            remain = max(0, chain.current_task_wake_at - time.time())
+            lines.append(
+                f"  [{chain.id}] 「{task.name}」{task.description} "
+                f"(剩余 {int(remain // 60)} 分 {int(remain % 60)} 秒) "
+                f"[{chain.current_index}/{len(chain.tasks)}]"
+            )
+        return (
+            "活跃任务链：\n" + "\n".join(lines) if lines else "当前没有活跃的任务链。"
+        )
+
+    async def _cancel_chain_locked(
+        self, session_id: str, conversation_id: str, chain_id: str
+    ) -> str:
+        chain = self._chains.get(chain_id)
+        if (
+            not chain
+            or chain.session_id != session_id
+            or chain.conversation_id != conversation_id
+        ):
+            return f"未找到任务链 {chain_id}。"
+        self._deactivate_chain(chain)
+        await self._save_chains_async()
+        return f"任务链 {chain_id} 已取消。"
+
+    async def _advance_chain_locked(
+        self, session_id: str, conversation_id: str, chain_id: str
+    ) -> str:
+        chain = self._chains.get(chain_id)
+        if (
+            not chain
+            or chain.session_id != session_id
+            or chain.conversation_id != conversation_id
+        ):
+            return f"未找到任务链 {chain_id}。"
+        if chain.is_completed:
+            return f"任务链 {chain_id} 已经完成。"
+
+        current = chain.current_task
+        next_task = chain.advance()
+        if next_task:
+            now_t = time.time()
+            chain.current_task_started_at = now_t
+            chain.current_task_wake_at = now_t + next_task.duration_minutes * 60
+            chain.reset_completion_listener()
+            chain.reset_callback_delivery()
+            wake = datetime.fromtimestamp(chain.current_task_wake_at).strftime(
+                "%H:%M:%S"
+            )
+            await self._save_chains_async()
+            return (
+                f"阶段「{current.name}」已完成，进入「{next_task.name}」。\n"
+                f"{next_task.description}\n预计 {next_task.duration_minutes} 分钟（{wake}）后唤醒。"
+            )
+        self._deactivate_chain(chain)
+        await self._save_chains_async()
+        return f"阶段「{current.name}」已完成，任务链全部完成！"
 
     @llm_tool(name="chain_task")
     async def chain_task(
@@ -436,213 +887,33 @@ class TaskChainToolPlugin(Star):
 
         async with self._lock:
             if action == "create":
-                if not conversation_id:
-                    return "错误：当前会话尚未初始化，无法创建后台任务。请先按当前人设自然回复，不要创建任务。"
-                try:
-                    tasks_data = json.loads(tasks_json)
-                except json.JSONDecodeError:
-                    return "错误：tasks_json 不是合法 JSON。"
-                if not isinstance(tasks_data, list):
-                    return "错误：tasks_json 必须是 JSON 数组。"
-                parsed_tasks = [self._parse_task(t) for t in tasks_data]
-                tasks_raw = [t for t in parsed_tasks if t]
-                if not tasks_raw:
-                    return "错误：任务列表不能为空。"
-
-                for c in self._chains.values():
-                    if (
-                        c.session_id == session_id
-                        and c.conversation_id == conversation_id
-                        and not c.is_completed
-                    ):
-                        c.is_active = False
-                        c.reset_completion_listener()
-                        self._chain_events.pop(c.id, None)
-
-                for t in tasks_raw:
-                    secs = max(t.duration_minutes * 60, MIN_TASK_SECONDS)
-                    t.duration_minutes = secs / 60
-
-                total_secs = sum(t.duration_minutes * 60 for t in tasks_raw)
-                merged = ChainTask(
-                    name=tasks_raw[0].name,
-                    description=tasks_raw[0].description,
-                    duration_minutes=total_secs / 60,
-                    prompt=next(
-                        (t.prompt for t in reversed(tasks_raw) if t.prompt),
-                        tasks_raw[0].prompt,
-                    ),
+                return await self._create_chain_locked(
+                    event,
+                    session_id,
+                    conversation_id,
+                    tasks_json,
                 )
-
-                checkin = self._make_checkin(merged)
-                main_secs = total_secs
-                if checkin:
-                    main_secs = max(
-                        MIN_TASK_SECONDS, total_secs - checkin.duration_minutes * 60
-                    )
-                main = ChainTask(
-                    name=merged.name,
-                    description=merged.description,
-                    duration_minutes=main_secs / 60,
-                    prompt=merged.prompt,
+            if action == "list":
+                return self._list_chains_locked(session_id, conversation_id)
+            if action == "cancel":
+                return await self._cancel_chain_locked(
+                    session_id,
+                    conversation_id,
+                    chain_id,
                 )
-                tasks = [checkin, main] if checkin else [main]
-                cid = uuid.uuid4().hex[:12]
-                now_t = time.time()
-
-                def _get_clean_attr(obj: Any, attr_path: str, default_val: Any) -> Any:
-                    parts = attr_path.split(".")
-                    curr = obj
-                    for p in parts:
-                        if curr is None:
-                            return default_val
-                        if type(curr).__name__ in ("MagicMock", "Mock", "AsyncMock"):
-                            return default_val
-                        val = getattr(curr, p, None)
-                        if callable(val) and type(val).__name__ not in (
-                            "MagicMock",
-                            "Mock",
-                            "AsyncMock",
-                        ):
-                            try:
-                                curr = val()
-                            except Exception:
-                                return default_val
-                        else:
-                            curr = val
-                    if curr is None or type(curr).__name__ in (
-                        "MagicMock",
-                        "Mock",
-                        "AsyncMock",
-                    ):
-                        return default_val
-                    return curr
-
-                chain = TaskChain(
-                    id=cid,
-                    session_id=session_id,
-                    conversation_id=conversation_id,
-                    system_prompt=self._chain_system_prompt(
-                        session_id, conversation_id
-                    ),
-                    tasks=tasks,
-                    created_at=now_t,
-                    current_task_started_at=now_t,
-                    current_task_wake_at=now_t + tasks[0].duration_minutes * 60,
-                    event_metadata={
-                        "platform_id": _get_clean_attr(
-                            event, "platform_meta.id", "mock"
-                        ),
-                        "platform_name": _get_clean_attr(
-                            event, "platform_meta.name", "mock"
-                        ),
-                        "session_id": _get_clean_attr(event, "session_id", ""),
-                        "message_type": _get_clean_attr(
-                            event, "get_message_type.value", 1
-                        ),
-                        "sender_id": _get_clean_attr(event, "get_sender_id", ""),
-                        "sender_name": _get_clean_attr(event, "get_sender_name", ""),
-                        "group_id": _get_clean_attr(event, "get_group_id", ""),
-                        "self_id": _get_clean_attr(event, "get_self_id", ""),
-                    },
+            if action == "advance":
+                return await self._advance_chain_locked(
+                    session_id,
+                    conversation_id,
+                    chain_id,
                 )
-                self._chains[cid] = chain
-                self._chain_events[cid] = event
-                self._save_chains()
-                main_dur = sum(t.duration_minutes * 60 for t in tasks_raw)
-                done_time = datetime.fromtimestamp(now_t + main_dur).strftime(
-                    "%H:%M:%S"
-                )
-                return (
-                    f"[任务已安排(id={cid})] "
-                    f"预计{done_time}完成。当前状态：任务刚开始，仍在进行中。"
-                    "注意：工具调用前你已经发出的文字、这个工具结果、接下来的最终回复属于同一轮对话，"
-                    "不是新的独立对话。最终回复要自然接上前一句，像同一段连续表达的后半句。"
-                    "如果你在调用工具前已经说过要去做、正在找路、正在准备或已经记下约定，"
-                    "不要重新打招呼、不要重复同义开头，只补充必要的新信息或轻轻收束。"
-                    "如果你还没对用户说过，则本轮只回应已经开始、正在准备、正在路上、正在处理或已经记下约定。"
-                    "你已经创建任务，表示角色已经愿意执行；本轮最终回复不能再拒绝、否认行动、说没空/不去，"
-                    "也不要让用户自己去做。"
-                    "如果工具调用前你已经把要做的事交代清楚，且没有新的必要信息要补充，本轮最终回复优先留空，"
-                    "直接结束这轮对话；不要为了回复而硬说“嗯/行/好/等着/知道了”等废话，"
-                    "也不要补“（起身走向厨房）”“（转身去拿）”这类括号动作、舞台说明或重复出发描述。"
-                    "不要在本轮追问会改变任务定义的细节；需要偏好、路线、材料等互动时，交给后续中途互动。"
-                    "严禁说已经做好、已经回来、已经到达、已经完成、已经把结果交给用户，或让用户提前体验结果。"
-                )
-
-            elif action == "list":
-                active = [
-                    c
-                    for c in self._chains.values()
-                    if (
-                        c.session_id == session_id
-                        and c.conversation_id == conversation_id
-                        and not c.is_completed
-                    )
-                ]
-                if not active:
-                    return "当前没有活跃的任务链。"
-                lines = []
-                for c in active:
-                    ct = c.current_task
-                    if not ct:
-                        continue
-                    remain = max(0, c.current_task_wake_at - time.time())
-                    lines.append(
-                        f"  [{c.id}] 「{ct.name}」{ct.description} "
-                        f"(剩余 {int(remain // 60)} 分 {int(remain % 60)} 秒) "
-                        f"[{c.current_index}/{len(c.tasks)}]"
-                    )
-                if not lines:
-                    return "当前没有活跃的任务链。"
-                return "活跃任务链：\n" + "\n".join(lines)
-
-            elif action == "cancel":
-                chain = self._chains.get(chain_id)
-                if (
-                    chain
-                    and chain.session_id == session_id
-                    and chain.conversation_id == conversation_id
-                ):
-                    chain.is_active = False
-                    self._chain_events.pop(chain_id, None)
-                    self._save_chains()
-                    return f"任务链 {chain_id} 已取消。"
-                return f"未找到任务链 {chain_id}。"
-
-            elif action == "advance":
-                chain = self._chains.get(chain_id)
-                if (
-                    not chain
-                    or chain.session_id != session_id
-                    or chain.conversation_id != conversation_id
-                ):
-                    return f"未找到任务链 {chain_id}。"
-                if chain.is_completed:
-                    return f"任务链 {chain_id} 已经完成。"
-                ct = chain.current_task
-                nxt = chain.advance()
-                if nxt:
-                    chain.current_task_started_at = time.time()
-                    chain.current_task_wake_at = time.time() + nxt.duration_minutes * 60
-                    wake = datetime.fromtimestamp(chain.current_task_wake_at).strftime(
-                        "%H:%M:%S"
-                    )
-                    self._save_chains()
-                    return (
-                        f"阶段「{ct.name}」已完成，进入「{nxt.name}」。\n"
-                        f"{nxt.description}\n预计 {nxt.duration_minutes} 分钟（{wake}）后唤醒。"
-                    )
-                chain.is_active = False
-                chain.reset_completion_listener()
-                self._save_chains()
-                return f"阶段「{ct.name}」已完成，任务链全部完成！"
-
             return f"未知操作：{action}"
 
     # ── 后台自动推进并发送自然提醒 ──
 
     async def initialize(self) -> None:
+        if self._scheduler_task and not self._scheduler_task.done():
+            return
         self._scheduler_task = asyncio.create_task(self._scheduler_loop())
 
     async def _scheduler_loop(self) -> None:
@@ -650,16 +921,55 @@ class TaskChainToolPlugin(Star):
             try:
                 await self._tick()
             except Exception as e:
-                logger.error(f"[TaskChainTool] scheduler: {e}")
+                logger.error(f"[TaskChainTool] scheduler: {e}", exc_info=True)
             await asyncio.sleep(10)
+
+    def _cleanup_expired_chains(self) -> bool:
+        """Remove completed/inactive chains older than 10 minutes."""
+        now_t = time.time()
+        expired = [
+            cid
+            for cid, c in self._chains.items()
+            if c.is_completed
+            and now_t - (c.finished_at or max(c.current_task_wake_at, c.created_at))
+            > 600
+        ]
+        for cid in expired:
+            chain = self._chains.pop(cid, None)
+            if chain:
+                self._chain_events.pop(cid, None)
+                self._deindex_chain(chain)
+        if expired:
+            logger.debug(f"[TaskChainTool] Cleaned up {len(expired)} expired chains")
+
+        active_sessions = {
+            (c.session_id, c.conversation_id)
+            for c in self._chains.values()
+            if c.is_active and c.conversation_id
+        }
+        stale_keys = [
+            k
+            for k in self._session_system_prompts
+            if k not in active_sessions
+            and now_t - self._session_prompt_seen_at.get(k, 0)
+            > PROMPT_CACHE_TTL_SECONDS
+        ]
+        for k in stale_keys:
+            del self._session_system_prompts[k]
+            self._session_prompt_seen_at.pop(k, None)
+        return bool(expired)
 
     async def _tick(self) -> None:
         now_t = time.time()
         to_advance: list[TaskChain] = []
         async with self._lock:
-            changed = False
+            changed = self._cleanup_expired_chains()
             for c in list(self._chains.values()):
                 if not c.is_active or c.is_completed:
+                    continue
+                if c.pending_callback_kind:
+                    if now_t >= c.callback_retry_at:
+                        to_advance.append(c)
                     continue
                 if c.completion_callback_at:
                     if now_t >= c.completion_callback_at:
@@ -669,13 +979,15 @@ class TaskChainToolPlugin(Star):
                 remain = c.current_task_wake_at - now_t
                 if is_last_task and 0 < remain <= COMPLETION_LISTEN_SECONDS:
                     c.completion_listen_started_at = now_t
-                    c.completion_callback_at = c.current_task_wake_at
+                    c.completion_callback_at = (
+                        c.current_task_wake_at + COMPLETION_LISTEN_SECONDS
+                    )
                     changed = True
                     continue
                 if now_t >= c.current_task_wake_at:
                     to_advance.append(c)
             if changed:
-                self._save_chains()
+                await self._save_chains_async()
 
         for chain in to_advance:
             await self._wake_and_advance(chain)
@@ -711,69 +1023,43 @@ class TaskChainToolPlugin(Star):
         return str(time.time_ns())
 
     def _build_callback_event(
-        self, chain: TaskChain, visible_text: str, kind: str
+        self,
+        chain: TaskChain,
+        visible_text: str,
+        kind: str,
+        token: str = "",
     ) -> AstrMessageEvent | None:
         import copy
 
-        source_event = self._chain_events.get(chain.id)
-        if not source_event and getattr(chain, "event_metadata", None):
-            try:
-                from astrbot.core.platform.platform_metadata import PlatformMetadata
-                from astrbot.core.platform.astrbot_message import (
-                    AstrBotMessage,
-                    GroupMember,
-                )
-                from astrbot.core.platform.message_type import MessageType
-
-                meta = chain.event_metadata
-                plat_meta = PlatformMetadata(
-                    id=meta.get("platform_id", "mock"),
-                    name=meta.get("platform_name", "mock"),
-                )
-
-                msg_obj = AstrBotMessage()
-                try:
-                    msg_obj.type = MessageType(meta.get("message_type", 1))
-                except Exception:
-                    msg_obj.type = MessageType.FRIEND_MESSAGE
-                msg_obj.self_id = meta.get("self_id", "")
-                msg_obj.session_id = meta.get("session_id", "")
-                msg_obj.group_id = meta.get("group_id", "")
-
-                sender = GroupMember()
-                sender.user_id = meta.get("sender_id", "")
-                sender.nickname = meta.get("sender_name", "")
-                msg_obj.sender = sender
-
-                class ConcreteMessageEvent(AstrMessageEvent):
-                    async def send(self, message):
-                        pass
-
-                source_event = ConcreteMessageEvent(
-                    message_str="",
-                    message_obj=msg_obj,
-                    platform_meta=plat_meta,
-                    session_id=meta.get("session_id", ""),
-                )
-            except Exception as e:
-                logger.error(f"[TaskChainTool] Rebuilding event failed: {e}")
-
-        if not source_event:
-            logger.error(
-                f"[TaskChainTool] no source event for pipeline callback: {chain.id}"
-            )
-            return None
         try:
             from astrbot.core.utils.trace import TraceSpan
 
-            new_event = copy.copy(source_event)
-            new_event.message_str = visible_text
-            new_event.message_obj = self._build_callback_message_object(
-                chain, source_event, visible_text
-            )
-            new_event._result = None
-            new_event._has_send_oper = False
-            new_event._extras = {}
+            try:
+                session = MessageSession.from_str(chain.session_id)
+                new_event = _ReliableCronMessageEvent(
+                    context=self.context,
+                    session=session,
+                    message=visible_text,
+                    sender_name="TaskChain",
+                    message_type=session.message_type,
+                )
+            except (TypeError, ValueError):
+                # 兼容旧测试数据和不规范的历史 UMO；正常生产路径使用 Cron 事件。
+                source_event = self._chain_events.get(chain.id)
+                if not source_event:
+                    logger.error(
+                        f"[TaskChainTool] invalid callback session: {chain.session_id}"
+                    )
+                    return None
+                new_event = copy.copy(source_event)
+                new_event.message_str = visible_text
+                new_event.message_obj = self._build_callback_message_object(
+                    chain, source_event, visible_text
+                )
+                new_event._result = None
+                new_event._has_send_oper = False
+                new_event._extras = {}
+
             new_event.trace = TraceSpan(
                 name="TaskChainCallback",
                 umo=new_event.unified_msg_origin,
@@ -786,15 +1072,26 @@ class TaskChainToolPlugin(Star):
             new_event.set_extra("taskchain_callback", True)
             new_event.set_extra("taskchain_chain_id", chain.id)
             new_event.set_extra("taskchain_callback_kind", kind)
+            if token:
+                new_event.set_extra(_CALLBACK_TOKEN_KEY, token)
             return new_event
         except Exception as e:
             logger.error(f"[TaskChainTool] build pipeline callback failed: {e}")
             return None
 
     async def _queue_pipeline_callback(
-        self, chain: TaskChain, text: str, kind: str
+        self,
+        chain: TaskChain,
+        text: str,
+        kind: str,
+        token: str = "",
     ) -> bool:
-        event = self._build_callback_event(chain, "[TaskChain callback]", kind)
+        event = self._build_callback_event(
+            chain,
+            "[TaskChain callback]",
+            kind,
+            token,
+        )
         if not event:
             return False
         try:
@@ -832,8 +1129,12 @@ class TaskChainToolPlugin(Star):
             )
             return None
         if kind == "interact":
-            chain.followup_after_history_len = self._conversation_history_len(conv)
-            self._save_chains()
+            history_len = self._conversation_history_len(conv)
+            async with self._lock:
+                current = self._chains.get(chain.id)
+                if current and current.is_active:
+                    current.followup_after_history_len = history_len
+                    await self._save_chains_async()
         req = ProviderRequest(
             prompt=text,
             session_id=chain.session_id,
@@ -884,45 +1185,195 @@ class TaskChainToolPlugin(Star):
             "不要推进到完成，不要重复刚才的话，不要提任务链、工具、后台或这段提示。"
         )
 
-    async def _wake_and_advance(self, chain: TaskChain) -> None:
+    def _finalize_callback_locked(self, chain: TaskChain, kind: str) -> bool:
+        """确认回调送达后推进状态；返回是否需要安排中途跟进。"""
+        current = chain.current_task
+        if not current:
+            self._deactivate_chain(chain)
+            return False
+
+        if kind == "interact":
+            scheduled_start = chain.current_task_wake_at
+            nxt = chain.advance()
+            if not nxt:
+                self._deactivate_chain(chain)
+                return False
+            chain.current_task_started_at = scheduled_start
+            chain.current_task_wake_at = scheduled_start + nxt.duration_minutes * 60
+            chain.reset_completion_listener()
+            chain.reset_callback_delivery()
+            return True
+
+        chain.advance()
+        self._deactivate_chain(chain)
+        return False
+
+    def _schedule_followup(self, chain: TaskChain, interact_text: str) -> None:
+        task = asyncio.create_task(
+            self._followup_check(
+                chain,
+                chain.session_id,
+                interact_text=interact_text,
+            )
+        )
+        self._followup_tasks.add(task)
+        task.add_done_callback(self._followup_tasks.discard)
+
+    @after_message_sent(priority=-100000)
+    async def _ack_callback_delivery(self, event: AstrMessageEvent) -> None:
+        token = str(event.get_extra(_CALLBACK_TOKEN_KEY, "") or "")
+        if not token:
+            return
+        if event.get_extra("taskchain_delivery_failed", False) is True:
+            return
+        if not getattr(event, "_has_send_oper", False):
+            return
+
+        chain_id = str(event.get_extra("taskchain_chain_id", "") or "")
+        should_followup = False
+        interact_text = ""
+        chain: TaskChain | None = None
         async with self._lock:
+            chain = self._chains.get(chain_id)
+            if (
+                not chain
+                or not chain.is_active
+                or chain.pending_callback_token != token
+            ):
+                return
+            kind = chain.pending_callback_kind
+            if kind == "interact" and chain.current_task:
+                current = chain.current_task
+                next_index = chain.current_index + 1
+                if next_index < len(chain.tasks):
+                    interact_text = self._interact_callback_text(
+                        current,
+                        chain.tasks[next_index],
+                    )
+            should_followup = self._finalize_callback_locked(chain, kind)
+            await self._save_chains_async()
+
+        if should_followup and chain:
+            self._schedule_followup(chain, interact_text)
+
+    async def _deliver_completion_fallback(
+        self,
+        chain: TaskChain,
+        token: str,
+    ) -> None:
+        task = chain.current_task
+        if not task:
+            return
+        try:
+            from astrbot.api.event import MessageChain
+
+            sent = await self.context.send_message(
+                chain.session_id,
+                MessageChain().message(f"「{task.name}」已经完成了。"),
+            )
+        except Exception as exc:
+            logger.error(
+                f"[TaskChainTool] completion fallback failed: {exc}",
+                exc_info=True,
+            )
+            return
+        if not sent:
+            logger.error(
+                f"[TaskChainTool] completion fallback not delivered: {chain.id}"
+            )
+            return
+
+        async with self._lock:
+            current = self._chains.get(chain.id)
+            if (
+                current
+                and current.is_active
+                and current.pending_callback_token == token
+            ):
+                self._finalize_callback_locked(current, "completion")
+                await self._save_chains_async()
+
+    async def _wake_and_advance(self, chain: TaskChain) -> None:
+        callback_text = ""
+        callback_kind = ""
+        callback_token = ""
+        use_fallback = False
+
+        async with self._lock:
+            chain = self._chains.get(chain.id, chain)
             if not chain.is_active or chain.is_completed:
                 return
             now_t = time.time()
-            due_at = chain.completion_callback_at or chain.current_task_wake_at
-            if now_t < due_at:
-                return
-
             ct = chain.current_task
             if not ct:
-                chain.is_active = False
-                self._save_chains()
+                self._deactivate_chain(chain)
+                await self._save_chains_async()
                 return
 
-            nxt = chain.advance()
-            if nxt:
-                chain.current_task_started_at = time.time()
-                chain.current_task_wake_at = time.time() + nxt.duration_minutes * 60
-                callback_text = self._interact_callback_text(ct, nxt)
-                callback_kind = "interact"
+            if chain.pending_callback_kind:
+                if now_t < chain.callback_retry_at:
+                    return
+                callback_kind = chain.pending_callback_kind
             else:
-                chain.is_active = False
+                due_at = chain.completion_callback_at or chain.current_task_wake_at
+                if now_t < due_at:
+                    return
+                callback_kind = (
+                    "interact"
+                    if chain.current_index < len(chain.tasks) - 1
+                    else "completion"
+                )
+                chain.pending_callback_kind = callback_kind
+                chain.callback_retry_count = 0
+
+            if callback_kind == "interact":
+                next_index = chain.current_index + 1
+                if next_index >= len(chain.tasks):
+                    self._deactivate_chain(chain)
+                    await self._save_chains_async()
+                    return
+                callback_text = self._interact_callback_text(
+                    ct,
+                    chain.tasks[next_index],
+                )
+            else:
                 callback_text = self._completion_callback_text(ct)
-                callback_kind = "completion"
-            chain.reset_completion_listener()
-            self._save_chains()
+
+            callback_token = uuid.uuid4().hex
+            chain.pending_callback_token = callback_token
+            chain.callback_retry_at = now_t + CALLBACK_ACK_TIMEOUT_SECONDS
+            use_fallback = chain.callback_retry_count >= MAX_CALLBACK_PIPELINE_ATTEMPTS
+            if not use_fallback:
+                chain.callback_retry_count += 1
+            await self._save_chains_async()
+
+        if use_fallback:
+            if callback_kind == "interact":
+                async with self._lock:
+                    current = self._chains.get(chain.id)
+                    if current and current.pending_callback_token == callback_token:
+                        self._finalize_callback_locked(current, "interact")
+                        await self._save_chains_async()
+                return
+            await self._deliver_completion_fallback(chain, callback_token)
+            return
 
         queued = await self._queue_pipeline_callback(
-            chain, callback_text, callback_kind
+            chain,
+            callback_text,
+            callback_kind,
+            callback_token,
         )
         if not queued:
-            logger.error(
-                f"[TaskChainTool] pipeline callback dropped: {chain.id}/{callback_kind}"
+            logger.warning(
+                f"[TaskChainTool] pipeline callback pending retry: "
+                f"{chain.id}/{callback_kind}"
             )
-        if nxt:
-            asyncio.create_task(self._followup_check(chain, chain.session_id))
-        else:
-            self._chain_events.pop(chain.id, None)
+            async with self._lock:
+                current = self._chains.get(chain.id)
+                if current and current.pending_callback_token == callback_token:
+                    current.callback_retry_at = time.time() + 10
+                    await self._save_chains_async()
 
     async def _followup_check(
         self, chain: TaskChain, session_id: str, interact_text: str = ""
@@ -950,21 +1401,12 @@ class TaskChainToolPlugin(Star):
             # 检查对应 interact 之后用户有没有回复。
             start_idx = max(0, int(chain.followup_after_history_len or 0))
             search_hist = hist[start_idx:]
+            # Find the first assistant message after the interact point
             interact_idx = None
-            for offset in range(len(search_hist) - 1, -1, -1):
-                item = search_hist[offset]
-                if not isinstance(item, dict) or item.get("role") != "assistant":
-                    continue
-                if interact_text and item.get("content") != interact_text:
-                    continue
-                interact_idx = start_idx + offset
-                break
-            if interact_idx is None and not interact_text:
-                for offset in range(len(search_hist) - 1, -1, -1):
-                    item = search_hist[offset]
-                    if isinstance(item, dict) and item.get("role") == "assistant":
-                        interact_idx = start_idx + offset
-                        break
+            for offset, item in enumerate(search_hist):
+                if isinstance(item, dict) and item.get("role") == "assistant":
+                    interact_idx = start_idx + offset
+                    break
             if interact_idx is not None:
                 after = hist[interact_idx + 1 :]
                 has_user_reply = any(
@@ -993,6 +1435,12 @@ class TaskChainToolPlugin(Star):
             logger.warning(f"[TaskChainTool] followup check failed: {e}")
 
     async def terminate(self) -> None:
+        for task in list(self._followup_tasks):
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
         if self._scheduler_task:
             self._scheduler_task.cancel()
             try:

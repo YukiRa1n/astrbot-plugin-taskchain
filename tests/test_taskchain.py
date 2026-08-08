@@ -30,12 +30,18 @@ os.environ.setdefault("TESTING", "true")
 os.environ.setdefault("ASTRBOT_TEST_MODE", "true")
 
 # ── 导入被测模块 ──
-from main import (
+from main import (  # noqa: E402
     ChainTask,
     COMPLETION_LISTEN_SECONDS,
     TaskChain,
     TaskChainToolPlugin as TaskChainPlugin,
     TOOL_USAGE_SYSTEM_PROMPT,
+    _PrepareSingleReplyFilter,
+    _ReliableCronMessageEvent,
+)
+from astrbot.core.message.message_event_result import (  # noqa: E402
+    MessageEventResult,
+    ResultContentType,
 )
 
 
@@ -209,6 +215,9 @@ class TestChainTaskTool:
     def mock_event(self):
         event = MagicMock()
         event.unified_msg_origin = "test_umo_123"
+        extras = {}
+        event.set_extra.side_effect = extras.__setitem__
+        event.get_extra.side_effect = lambda key, default=None: extras.get(key, default)
         return event
 
     @pytest.fixture
@@ -251,12 +260,59 @@ class TestChainTaskTool:
         assert "任务已安排" in result
         assert "id=" in result
         assert "本轮最终回复不能再拒绝" in result
-        assert "本轮最终回复优先留空" in result
-        assert "不要为了回复而硬说" in result
-        assert "括号动作、舞台说明或重复出发描述" in result
+        assert "本轮最终只输出一段简短、完整的人设回复" in result
         assert "不要在本轮追问会改变任务定义的细节" in result
         assert "交给后续中途互动" in result
         assert len(plugin._chains) == 1
+
+    @pytest.mark.asyncio
+    async def test_create_suppresses_post_tool_reply_when_pre_reply_was_sent(
+        self, plugin, mock_event
+    ):
+        pre_result = MessageEventResult().message("我去准备，等我一下。")
+        pre_result.set_result_content_type(ResultContentType.LLM_RESULT)
+        mock_event.get_result.return_value = pre_result
+
+        await plugin._consolidate_create_reply(mock_event)
+        tool_result = await plugin.chain_task(
+            mock_event,
+            action="create",
+            tasks_json='[{"name":"泡咖啡","duration_minutes":1}]',
+        )
+
+        post_result = MessageEventResult().message("好，我现在去泡咖啡。")
+        post_result.set_result_content_type(ResultContentType.LLM_RESULT)
+        mock_event.get_result.return_value = post_result
+        await plugin._consolidate_create_reply(mock_event)
+
+        assert "本轮最终输出必须为空" in tool_result
+        assert post_result.chain == []
+
+    @pytest.mark.asyncio
+    async def test_create_keeps_post_tool_reply_without_pre_reply(
+        self, plugin, mock_event
+    ):
+        tool_result = await plugin.chain_task(
+            mock_event,
+            action="create",
+            tasks_json='[{"name":"泡咖啡","duration_minutes":1}]',
+        )
+
+        post_result = MessageEventResult().message("我去准备，等我一下。")
+        post_result.set_result_content_type(ResultContentType.LLM_RESULT)
+        mock_event.get_result.return_value = post_result
+        await plugin._consolidate_create_reply(mock_event)
+
+        assert "本轮最终只输出一段简短、完整的人设回复" in tool_result
+        assert post_result.get_plain_text() == "我去准备，等我一下。"
+
+    def test_single_reply_filter_disables_streaming_without_waking_handler(self):
+        event = MagicMock()
+
+        matched = _PrepareSingleReplyFilter().filter(event, None)
+
+        assert matched is False
+        event.set_extra.assert_called_once_with("enable_streaming", False)
 
     @pytest.mark.asyncio
     async def test_create_chain_preserves_description_and_prompt(
@@ -904,7 +960,9 @@ class TestSchedulerTick:
         event.message_obj.group = None
         event.message_obj.sender = MagicMock()
         event.get_sender_name.return_value = "tester"
-        event.set_extra = MagicMock()
+        extras = {}
+        event.set_extra.side_effect = extras.__setitem__
+        event.get_extra.side_effect = lambda key, default=None: extras.get(key, default)
         plugin._chain_events[chain.id] = event
         return event
 
@@ -916,6 +974,10 @@ class TestSchedulerTick:
             if call.args and call.args[0] == "provider_request":
                 return call.args[1].prompt
         raise AssertionError("provider_request not attached")
+
+    async def _ack_callback(self, plugin, event):
+        event._has_send_oper = True
+        await plugin._ack_callback_delivery(event)
 
     @pytest.mark.asyncio
     async def test_tick_no_chains(self, plugin):
@@ -958,9 +1020,15 @@ class TestSchedulerTick:
             current_task_wake_at=now_t - 1,  # already due
         )
         plugin._chains["c1"] = chain
+        self._attach_source_event(plugin, chain)
         await plugin._tick()
 
-        # Chain should have advanced to next task
+        assert chain.current_index == 0
+        assert chain.pending_callback_kind == "interact"
+        event = self._queued_event(plugin)
+        await self._ack_callback(plugin, event)
+
+        # 只有平台发送成功后才推进，避免入队/发送失败时永久丢任务。
         assert chain.current_index == 1
         assert chain.current_task.name == "t2"
         assert chain.is_active is True
@@ -987,9 +1055,14 @@ class TestSchedulerTick:
         self._attach_source_event(plugin, chain)
         await plugin._tick()
 
+        assert chain.is_active is True
+        assert chain.current_index == 0
+        assert chain.pending_callback_kind == "completion"
+        event = self._queued_event(plugin)
+        await self._ack_callback(plugin, event)
+
         assert chain.is_active is False
         assert chain.current_index == 1
-        event = self._queued_event(plugin)
         prompt = self._provider_prompt(event)
         assert event.message_str == "[TaskChain callback]"
         assert "「last」已经完成" in prompt
@@ -1053,7 +1126,7 @@ class TestSchedulerTick:
 
         assert chain.is_active is True
         assert chain.current_index == 0
-        assert chain.completion_callback_at == wake_at
+        assert chain.completion_callback_at == wake_at + COMPLETION_LISTEN_SECONDS
 
     @pytest.mark.asyncio
     async def test_tick_multiple_due(self, plugin):
@@ -1083,9 +1156,19 @@ class TestSchedulerTick:
         self._attach_source_event(plugin, c1)
         self._attach_source_event(plugin, c2)
         await plugin._tick()
+
+        assert c1.current_index == 0
+        assert c2.current_index == 0
+        events = [
+            self._queued_event(plugin),
+            self._queued_event(plugin),
+        ]
+        for event in events:
+            await self._ack_callback(plugin, event)
+
         assert c1.current_index == 1
         assert c2.current_index == 1
-        assert plugin.context.get_event_queue.return_value.qsize() == 2
+        assert plugin.context.get_event_queue.return_value.qsize() == 0
 
     @pytest.mark.asyncio
     async def test_midtask_prompt_describes_in_progress_constraints(self, plugin):
@@ -1332,12 +1415,15 @@ class TestSchedulerTick:
         await plugin._wake_and_advance(chain)
 
         plugin.context.send_message.assert_not_awaited()
+        event = self._queued_event(plugin)
+        await self._ack_callback(plugin, event)
+
         assert chain.is_active is False
         assert chain.current_index == 1
-        assert plugin.context.get_event_queue.return_value.qsize() == 1
+        assert plugin.context.get_event_queue.return_value.qsize() == 0
 
     @pytest.mark.asyncio
-    async def test_missing_source_event_drops_pipeline_callback(self, plugin):
+    async def test_missing_source_event_keeps_callback_pending_for_retry(self, plugin):
         now_t = time.time()
 
         chain = TaskChain(
@@ -1353,9 +1439,64 @@ class TestSchedulerTick:
 
         await plugin._wake_and_advance(chain)
 
-        assert chain.is_active is False
-        assert chain.current_index == 1
+        assert chain.is_active is True
+        assert chain.current_index == 0
+        assert chain.pending_callback_kind == "completion"
+        assert chain.callback_retry_count == 1
+        assert chain.callback_retry_at > time.time()
         assert plugin.context.get_event_queue.return_value.qsize() == 0
+
+    @pytest.mark.asyncio
+    async def test_restart_callback_uses_session_without_source_event(self, plugin):
+        now_t = time.time()
+        chain = TaskChain(
+            id="restored",
+            session_id="mock:FriendMessage:user-1",
+            conversation_id="conv1",
+            tasks=[ChainTask(name="整理资料", duration_minutes=1)],
+            created_at=now_t - 120,
+            current_task_started_at=now_t - 120,
+            current_task_wake_at=now_t - 1,
+        )
+        plugin._chains[chain.id] = chain
+
+        await plugin._wake_and_advance(chain)
+
+        event = self._queued_event(plugin)
+        assert isinstance(event, _ReliableCronMessageEvent)
+        assert event.unified_msg_origin == chain.session_id
+        assert chain.current_index == 0
+        assert chain.pending_callback_kind == "completion"
+
+        await event.send(MessageEventResult().message("资料整理好了。"))
+        await plugin._ack_callback_delivery(event)
+
+        plugin.context.send_message.assert_awaited_once()
+        assert chain.current_index == 1
+        assert chain.is_active is False
+
+    @pytest.mark.asyncio
+    async def test_completion_falls_back_after_pipeline_retry_limit(self, plugin):
+        now_t = time.time()
+        plugin.context.send_message = AsyncMock(return_value=True)
+        chain = TaskChain(
+            id="fallback",
+            session_id="invalid-session",
+            conversation_id="conv1",
+            tasks=[ChainTask(name="整理资料", duration_minutes=1)],
+            created_at=now_t - 120,
+            current_task_started_at=now_t - 120,
+            current_task_wake_at=now_t - 1,
+        )
+        plugin._chains[chain.id] = chain
+
+        for _ in range(4):
+            chain.callback_retry_at = 0
+            await plugin._wake_and_advance(chain)
+
+        plugin.context.send_message.assert_awaited_once()
+        assert chain.current_index == 1
+        assert chain.is_active is False
 
     @pytest.mark.asyncio
     async def test_followup_prompt_keeps_second_message_short(
