@@ -29,6 +29,7 @@ MIN_TASK_SECONDS = 10
 CALLBACK_ACK_TIMEOUT_SECONDS = 120
 MAX_CALLBACK_PIPELINE_ATTEMPTS = 3
 PROMPT_CACHE_TTL_SECONDS = 3600
+MIN_CREATE_INTERVAL = 2.0  # 每会话最小创建间隔(秒),防快速重复 create
 
 _PRE_TOOL_REPLY_KEY = "taskchain_pre_tool_reply"
 _CREATE_SUCCEEDED_KEY = "taskchain_create_succeeded"
@@ -162,6 +163,7 @@ class TaskChainToolPlugin(Star):
         self._session_system_prompts: dict[tuple[str, str], str] = {}
         self._session_prompt_seen_at: dict[tuple[str, str], float] = {}
         self._lock = asyncio.Lock()
+        self._last_create_at: dict[str, float] = {}
         self._scheduler_task: asyncio.Task | None = None
         self._followup_tasks: set[asyncio.Task] = set()
         self._session_index: dict[str, list[str]] = {}
@@ -601,6 +603,13 @@ class TaskChainToolPlugin(Star):
         name = str(raw.get("name", "")).strip()
         description = str(raw.get("description", "") or "")
         prompt = str(raw.get("prompt", "") or "")
+        # 字段长度上限(防超长内容撑爆持久化/回调/LLM 上下文)
+        if len(name) > 100:
+            name = name[:100]
+        if len(description) > 500:
+            description = description[:500]
+        if len(prompt) > 2000:
+            prompt = prompt[:2000]
         try:
             duration = float(raw.get("duration_minutes", 10))
         except (TypeError, ValueError):
@@ -727,7 +736,18 @@ class TaskChainToolPlugin(Star):
         source_tasks, error = self._parse_create_tasks(tasks_json)
         if error:
             return error
-        for chain in self._active_chains_for_session(session_id):
+        active_chains = self._active_chains_for_session(session_id)
+        has_same_conversation = any(
+            c.conversation_id == conversation_id for c in active_chains
+        )
+        # 每会话最小创建间隔(仅当无活跃链时生效;替换已有链不算刷)
+        if not has_same_conversation:
+            now_t = time.time()
+            last = self._last_create_at.get(session_id, 0.0)
+            if now_t - last < MIN_CREATE_INTERVAL:
+                return "错误：操作太频繁，请稍后再创建任务。"
+            self._last_create_at[session_id] = now_t
+        for chain in active_chains:
             if chain.conversation_id == conversation_id:
                 self._deactivate_chain(chain)
 
